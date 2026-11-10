@@ -8,7 +8,8 @@
 #
 # Usage: test-toolchain.sh
 # Requires: build-toolchain.sh already run, and the MINIX image built with
-# the i386 HAVE_INITFINI_ARRAY csu/rtld (repo branch hyprland-support).
+# the i386 HAVE_INITFINI_ARRAY csu/rtld (edrich/minix master; formerly the
+# hyprland-support branch).
 
 set -eu
 

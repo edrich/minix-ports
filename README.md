@@ -1,9 +1,16 @@
 # minix-ports — out-of-tree ports overlay for MINIX 3 (Hyprland project)
 
-This directory lives **outside** the MINIX source tree (sibling of
-`../obj.i386` and of the `minix` repo) and holds everything that should not
-be part of the OS build itself: a modern cross toolchain and the third-party
-ports (wayland, wlroots, Hyprland ...) built with it.
+This repository is the companion of the main MINIX source repo,
+[edrich/minix](https://github.com/edrich/minix). It lives **outside** the
+MINIX source tree (checked out as a sibling of `../obj.i386` and of the
+`minix` checkout) and holds everything that should not be part of the OS
+build itself: a modern cross toolchain and the third-party ports (wayland,
+wlroots, Hyprland ...) built with it.
+
+```
+git clone https://github.com/edrich/minix.git
+git clone https://github.com/edrich/minix-ports.git
+```
 
 ## Layout
 
@@ -102,10 +109,14 @@ ports (wayland, wlroots, Hyprland ...) built with it.
 
 ## Prereqs
 
+- A checkout of [edrich/minix](https://github.com/edrich/minix) (`master`)
+  next to this one (`../minix`); paths like `minix/docker/` and
+  `minix/releasetools/` below refer to it.
 - The MINIX OS must be built once (sysroot is `../obj.docker.i386/destdir.i386`
   by default — from the docker/ workflow; override with `MINIX_SYSROOT`) and
-  the boot image produced (`minix/minix_x86.img`) with the hyprland-support
-  branch's dual-stack i386 csu/rtld change.
+  the boot image produced (`minix/minix_x86.img`). `master` includes the
+  dual-stack i386 csu/rtld change the toolchain relies on (merged from the
+  former `hyprland-support` branch).
 - Host: docker (see `minix/docker/README.md`) or: gcc/g++, flex, bison,
   texinfo, gmp/mpfr/mpc dev libs, qemu-system-i386, mke2fs, python3.
 - `src/` (tarballs + patched source trees, ~1.8G) and `build/` are
