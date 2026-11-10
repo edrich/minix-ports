@@ -1,0 +1,113 @@
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/char32.c b/char32.c
+--- a/char32.c	2025-01-18 10:31:05.000000000 +0200
++++ b/char32.c	2026-11-10 19:05:43.565884522 +0200
+@@ -34,7 +34,9 @@
+ #if !defined(__STDC_UTF_32__) || !__STDC_UTF_32__
+  #error "char32_t does not use UTF-32"
+ #endif
+-#if (!defined(__STDC_ISO_10646__) || !__STDC_ISO_10646__) && !defined(__FreeBSD__)
++/* MINIX: like FreeBSD, wchar_t holds Unicode code points in UTF-8 locales
++ * (foot requires one) without __STDC_ISO_10646__. */
++#if (!defined(__STDC_ISO_10646__) || !__STDC_ISO_10646__) && !defined(__FreeBSD__) && !defined(__minix)
+  #error "wchar_t does not use UTF-32"
+ #endif
+ 
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/fdm.c b/fdm.c
+--- a/fdm.c	2025-01-18 10:31:05.000000000 +0200
++++ b/fdm.c	2026-11-10 19:06:37.103947329 +0200
+@@ -8,6 +8,11 @@
+ #include <fcntl.h>
+ #include <signal.h>
+ 
++#if !defined(SIGRTMAX)
++ /* MINIX: no real-time signals; size the tables for all signals. */
++ #define SIGRTMAX NSIG
++#endif
++
+ #include <sys/epoll.h>
+ 
+ #include <tllist.h>
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/main.c b/main.c
+--- a/main.c	2025-01-18 10:31:05.000000000 +0200
++++ b/main.c	2026-11-10 19:06:37.104090169 +0200
+@@ -6,6 +6,11 @@
+ #include <locale.h>
+ #include <getopt.h>
+ #include <signal.h>
++
++#if !defined(SIGRTMAX)
++ /* MINIX: no real-time signals; size the tables for all signals. */
++ #define SIGRTMAX NSIG
++#endif
+ #include <errno.h>
+ #include <unistd.h>
+ 
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/render.c b/render.c
+--- a/render.c	2025-01-18 10:31:05.000000000 +0200
++++ b/render.c	2026-11-10 18:54:58.405927513 +0200
+@@ -17,6 +17,9 @@
+  #define pthread_setname_np(thread, name) (pthread_set_name_np(thread, name), 0)
+ #elif defined(__NetBSD__)
+  #define pthread_setname_np(thread, name) pthread_setname_np(thread, "%s", (void *)name)
++#elif defined(__minix)
++ /* MINIX: libmthread threads have no names. */
++ #define pthread_setname_np(thread, name) ((void)(thread), (void)(name), 0)
+ #endif
+ 
+ #include <presentation-time.h>
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/server.c b/server.c
+--- a/server.c	2025-01-18 10:31:05.000000000 +0200
++++ b/server.c	2026-11-10 19:06:37.104376759 +0200
+@@ -386,8 +386,20 @@
+ 
+     struct sockaddr_un addr;
+     socklen_t addr_size = sizeof(addr);
++#if defined(__minix)
++    /* MINIX: no accept4(). */
++    int client_fd = accept(server->fd, (struct sockaddr *)&addr, &addr_size);
++    if (client_fd >= 0 &&
++        (fcntl(client_fd, F_SETFD, FD_CLOEXEC) < 0 ||
++         fcntl(client_fd, F_SETFL, fcntl(client_fd, F_GETFL) | O_NONBLOCK) < 0))
++    {
++        close(client_fd);
++        client_fd = -1;
++    }
++#else
+     int client_fd = accept4(
+         server->fd, (struct sockaddr *)&addr, &addr_size, SOCK_CLOEXEC | SOCK_NONBLOCK);
++#endif
+ 
+     if (client_fd == -1) {
+         LOG_ERRNO("failed to accept client connection");
+@@ -467,9 +479,16 @@
+         return false;
+     }
+ 
++#if defined(SO_DOMAIN)
+     int const socket_options[] = { SO_DOMAIN, SO_ACCEPTCONN, SO_TYPE };
+     int const socket_options_values[] = { AF_UNIX, 1, SOCK_STREAM};
+     char const * const socket_options_names[] = { "SO_DOMAIN", "SO_ACCEPTCONN", "SO_TYPE" };
++#else
++    /* MINIX: no SO_DOMAIN. */
++    int const socket_options[] = { SO_ACCEPTCONN, SO_TYPE };
++    int const socket_options_values[] = { 1, SOCK_STREAM};
++    char const * const socket_options_names[] = { "SO_ACCEPTCONN", "SO_TYPE" };
++#endif
+ 
+     xassert(ALEN(socket_options) == ALEN(socket_options_values));
+     xassert(ALEN(socket_options) == ALEN(socket_options_names));
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/shm.c b/shm.c
+--- a/shm.c	2025-01-18 10:31:05.000000000 +0200
++++ b/shm.c	2026-11-10 19:10:25.871831039 +0200
+@@ -23,6 +23,11 @@
+ #include "macros.h"
+ #include "xmalloc.h"
+ 
++#if defined(__minix)
++ /* MINIX: MAP_UNINITIALIZED is a privileged flag (VM fails the mmap with
++  * ENOMEM for other processes); Linux just ignores it here. */
++ #undef MAP_UNINITIALIZED
++#endif
+ #if !defined(MAP_UNINITIALIZED)
+  #define MAP_UNINITIALIZED 0
+ #endif
