@@ -1,0 +1,875 @@
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' -x wlroots -x hyprland-protocols a/meson.build b/meson.build
+--- a/meson.build	2023-02-21 01:17:31.000000000 +0200
++++ b/meson.build	2026-11-10 13:53:56.897384831 +0200
+@@ -1,5 +1,6 @@
+ project('Hyprland', 'cpp', 'c',
+-  version : run_command('jq', '-r', '.version', join_paths(meson.source_root(), 'props.json'), check: true).stdout().strip(),
++  # MINIX: no jq in the build environment (props.json "version").
++  version : '0.22.0',
+   default_options : [
+     'warning_level=2',
+     'default_library=static',
+@@ -20,10 +21,11 @@
+   error('Could not configure current C++ compiler (' + cpp_compiler.get_id() + ' ' + cpp_compiler.version() + ') with required C++ standard (C++23)')
+ endif
+ 
+-GIT_BRANCH = run_command('git', 'rev-parse', '--abbrev-ref', 'HEAD', check: false).stdout().strip()
+-GIT_COMMIT_HASH = run_command('git', 'rev-parse', 'HEAD', check: false).stdout().strip()
+-GIT_COMMIT_MESSAGE = run_command('sh', '-c', 'git show | head -n 5 | tail -n 1', check: false).stdout().strip()
+-GIT_DIRTY = run_command('sh', '-c', 'git diff-index --quiet HEAD -- || echo "dirty"', check: false).stdout().strip()
++# MINIX: built from the release tarball (no .git, maybe no git at all).
++GIT_BRANCH = 'v0.22.0beta'
++GIT_COMMIT_HASH = run_command('sh', '-c', 'git rev-parse HEAD 2>/dev/null', check: false).stdout().strip()
++GIT_COMMIT_MESSAGE = ''
++GIT_DIRTY = ''
+ 
+ add_project_arguments(
+   [
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' -x wlroots -x hyprland-protocols a/src/Compositor.cpp b/src/Compositor.cpp
+--- a/src/Compositor.cpp	2023-02-21 01:17:31.000000000 +0200
++++ b/src/Compositor.cpp	2026-11-10 14:06:05.437926536 +0200
+@@ -45,7 +45,7 @@
+ 
+     Debug::log(LOG, "Instance Signature: %s", m_szInstanceSignature.c_str());
+ 
+-    Debug::log(LOG, "Hyprland PID: %i", m_iHyprlandPID);
++    Debug::log(LOG, "Hyprland PID: %i", (int)m_iHyprlandPID);
+ 
+     Debug::log(LOG, "===== SYSTEM INFO: =====");
+ 
+@@ -1821,7 +1821,7 @@
+     if (pWorkspace->m_iMonitorID == pMonitor->ID)
+         return;
+ 
+-    Debug::log(LOG, "moveWorkspaceToMonitor: Moving %d to monitor %d", pWorkspace->m_iID, pMonitor->ID);
++    Debug::log(LOG, "moveWorkspaceToMonitor: Moving %d to monitor %d", pWorkspace->m_iID, (int)pMonitor->ID);
+ 
+     const auto POLDMON = getMonitorFromID(pWorkspace->m_iMonitorID);
+ 
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' -x wlroots -x hyprland-protocols a/src/debug/CrashReporter.cpp b/src/debug/CrashReporter.cpp
+--- a/src/debug/CrashReporter.cpp	2023-02-21 01:17:31.000000000 +0200
++++ b/src/debug/CrashReporter.cpp	2026-11-10 14:06:05.438314645 +0200
+@@ -91,6 +91,12 @@
+ #elif defined(__OpenBSD__)
+     // Neither KERN_PROC_PATHNAME nor /proc are supported
+     const auto FPATH = std::filesystem::canonical("/usr/local/bin/Hyprland");
++#elif defined(__minix)
++    // No /proc/self/exe; canonical() must not throw in a crash handler
++    // (an uncaught filesystem_error turned every crash into an abort
++    // without a report).
++    std::error_code ec;
++    const auto      FPATH = std::filesystem::canonical("/usr/pkg/bin/Hyprland", ec);
+ #else
+     const auto FPATH = std::filesystem::canonical("/proc/self/exe");
+ #endif
+@@ -99,9 +105,9 @@
+         finalCrashReport += getFormat("\t#%i | %s\n", i, btSymbols[i]);
+ 
+ #ifdef __clang__
+-        const auto CMD       = getFormat("llvm-addr2line -e %s -f 0x%lx", FPATH.c_str(), (uint64_t)bt[i]);
++        const auto CMD       = getFormat("llvm-addr2line -e %s -f 0x%llx", FPATH.c_str(), (unsigned long long)(uintptr_t)bt[i]);
+ #else
+-        const auto CMD       = getFormat("addr2line -e %s -f 0x%lx", FPATH.c_str(), (uint64_t)bt[i]);
++        const auto CMD       = getFormat("addr2line -e %s -f 0x%llx", FPATH.c_str(), (unsigned long long)(uintptr_t)bt[i]);
+ #endif
+         const auto ADDR2LINE = replaceInString(execAndGet(CMD.c_str()), "\n", "\n\t\t");
+         finalCrashReport += "\t\t" + ADDR2LINE.substr(0, ADDR2LINE.length() - 2);
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' -x wlroots -x hyprland-protocols a/src/debug/HyprCtl.cpp b/src/debug/HyprCtl.cpp
+--- a/src/debug/HyprCtl.cpp	2023-02-21 01:17:31.000000000 +0200
++++ b/src/debug/HyprCtl.cpp	2026-11-10 14:06:05.438915395 +0200
+@@ -44,7 +44,7 @@
+     "dpmsStatus": %s,
+     "vrr": %s
+ },)#",
+-                m->ID, escapeJSONStrings(m->szName).c_str(), escapeJSONStrings(m->output->description ? m->output->description : "").c_str(),
++                (int)m->ID, escapeJSONStrings(m->szName).c_str(), escapeJSONStrings(m->output->description ? m->output->description : "").c_str(),
+                 (m->output->make ? m->output->make : ""), (m->output->model ? m->output->model : ""), (m->output->serial ? m->output->serial : ""), (int)m->vecPixelSize.x,
+                 (int)m->vecPixelSize.y, m->refreshRate, (int)m->vecPosition.x, (int)m->vecPosition.y, m->activeWorkspace,
+                 escapeJSONStrings(g_pCompositor->getWorkspaceByID(m->activeWorkspace)->m_szName).c_str(), (int)m->vecReservedTopLeft.x, (int)m->vecReservedTopLeft.y,
+@@ -61,7 +61,7 @@
+             result += getFormat("Monitor %s (ID %i):\n\t%ix%i@%f at %ix%i\n\tdescription: %s\n\tmake: %s\n\tmodel: %s\n\tserial: %s\n\tactive workspace: %i (%s)\n\treserved: %i "
+                                 "%i %i %i\n\tscale: %.2f\n\ttransform: "
+                                 "%i\n\tfocused: %s\n\tdpmsStatus: %i\n\tvrr: %i\n\n",
+-                                m->szName.c_str(), m->ID, (int)m->vecPixelSize.x, (int)m->vecPixelSize.y, m->refreshRate, (int)m->vecPosition.x, (int)m->vecPosition.y,
++                                m->szName.c_str(), (int)m->ID, (int)m->vecPixelSize.x, (int)m->vecPixelSize.y, m->refreshRate, (int)m->vecPosition.x, (int)m->vecPosition.y,
+                                 (m->output->description ? m->output->description : ""), (m->output->make ? m->output->make : ""), (m->output->model ? m->output->model : ""),
+                                 (m->output->serial ? m->output->serial : ""), m->activeWorkspace, g_pCompositor->getWorkspaceByID(m->activeWorkspace)->m_szName.c_str(),
+                                 (int)m->vecReservedTopLeft.x, (int)m->vecReservedTopLeft.y, (int)m->vecReservedBottomRight.x, (int)m->vecReservedBottomRight.y, m->scale,
+@@ -132,7 +132,7 @@
+                                   g_pCompositor->getWorkspaceByID(w->m_iWorkspaceID) ? g_pCompositor->getWorkspaceByID(w->m_iWorkspaceID)->m_szName :
+                                                                                        std::string("Invalid workspace " + std::to_string(w->m_iWorkspaceID)))
+                 .c_str(),
+-            ((int)w->m_bIsFloating == 1 ? "true" : "false"), w->m_iMonitorID, escapeJSONStrings(g_pXWaylandManager->getAppIDClass(w)).c_str(),
++            ((int)w->m_bIsFloating == 1 ? "true" : "false"), (int)w->m_iMonitorID, escapeJSONStrings(g_pXWaylandManager->getAppIDClass(w)).c_str(),
+             escapeJSONStrings(g_pXWaylandManager->getTitle(w)).c_str(), w->getPID(), ((int)w->m_bIsX11 == 1 ? "true" : "false"), (w->m_bPinned ? "true" : "false"),
+             (w->m_bIsFullscreen ? "true" : "false"),
+             (w->m_bIsFullscreen ? (g_pCompositor->getWorkspaceByID(w->m_iWorkspaceID) ? g_pCompositor->getWorkspaceByID(w->m_iWorkspaceID)->m_efFullscreenMode : 0) : 0),
+@@ -146,7 +146,7 @@
+             (w->m_iWorkspaceID == -1                                ? "" :
+                  g_pCompositor->getWorkspaceByID(w->m_iWorkspaceID) ? g_pCompositor->getWorkspaceByID(w->m_iWorkspaceID)->m_szName.c_str() :
+                                                                       std::string("Invalid workspace " + std::to_string(w->m_iWorkspaceID)).c_str()),
+-            (int)w->m_bIsFloating, w->m_iMonitorID, g_pXWaylandManager->getAppIDClass(w).c_str(), g_pXWaylandManager->getTitle(w).c_str(), w->getPID(), (int)w->m_bIsX11,
++            (int)w->m_bIsFloating, (int)w->m_iMonitorID, g_pXWaylandManager->getAppIDClass(w).c_str(), g_pXWaylandManager->getTitle(w).c_str(), w->getPID(), (int)w->m_bIsX11,
+             (int)w->m_bPinned, (int)w->m_bIsFullscreen,
+             (w->m_bIsFullscreen ? (g_pCompositor->getWorkspaceByID(w->m_iWorkspaceID) ? g_pCompositor->getWorkspaceByID(w->m_iWorkspaceID)->m_efFullscreenMode : 0) : 0),
+             (int)w->m_bFakeFullscreenState, getGroupedData(w, format).c_str(), w->m_pSwallowed);
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' -x wlroots -x hyprland-protocols a/src/debug/Log.hpp b/src/debug/Log.hpp
+--- a/src/debug/Log.hpp	2023-02-21 01:17:31.000000000 +0200
++++ b/src/debug/Log.hpp	2026-11-10 14:05:08.419679743 +0200
+@@ -16,7 +16,7 @@
+ 
+ namespace Debug {
+     void               init(const std::string& IS);
+-    void               log(LogLevel level, const char* fmt, ...);
++    void               log(LogLevel level, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
+     void               wlrLog(wlr_log_importance level, const char* fmt, va_list args);
+ 
+     inline std::string logFile;
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' -x wlroots -x hyprland-protocols a/src/events/Monitors.cpp b/src/events/Monitors.cpp
+--- a/src/events/Monitors.cpp	2023-02-21 01:17:31.000000000 +0200
++++ b/src/events/Monitors.cpp	2026-11-10 16:25:25.015752984 +0200
+@@ -5,6 +5,59 @@
+ #include "Events.hpp"
+ #include "../debug/HyprCtl.hpp"
+ 
++// MINIX (software rendering): HYPRLAND_MINIX_FRAMESTATS=1 prints, every 5 s,
++// how many frames were rendered, the damage they covered and where the
++// time went (each section ends with glFinish, so softpipe's work is
++// attributed to the section that queued it).  Sections are timed with the
++// TSC, calibrated against the clock over the report window: MINIX clocks
++// tick at 60 Hz, too coarse for single sections.
++#include <x86intrin.h>
++namespace {
++struct SMinixFrameStats {
++    bool     enabled = getenv("HYPRLAND_MINIX_FRAMESTATS") != nullptr;
++    int      frames = 0, skipped = 0, rects = 0;
++    double   damagePx = 0, tClear = 0, tClients = 0, tEnd = 0, tCommit = 0; // TSC cycles
++    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
++    unsigned long long                    lastTsc = __rdtsc(), mark = 0;
++
++    void begin() {
++        mark = __rdtsc();
++    }
++    // TSC cycles since the last section boundary
++    double section(bool finish = true) {
++        if (finish)
++            glFinish();
++        const auto NOW = __rdtsc();
++        const auto C   = (double)(NOW - mark);
++        mark           = NOW;
++        return C;
++    }
++    void damage(pixman_region32_t* rg) {
++        int   n   = 0;
++        auto* box = pixman_region32_rectangles(rg, &n);
++        rects += n;
++        for (int i = 0; i < n; i++)
++            damagePx += (double)(box[i].x2 - box[i].x1) * (box[i].y2 - box[i].y1);
++    }
++    void report() {
++        const auto NOW  = std::chrono::steady_clock::now();
++        const auto SECS = std::chrono::duration<double>(NOW - last).count();
++        if (SECS < 5)
++            return;
++        const int    F    = frames ? frames : 1;
++        const double MSPC = SECS * 1000.0 / (double)(__rdtsc() - lastTsc); // ms per cycle
++        tClear *= MSPC;
++        tClients *= MSPC;
++        tEnd *= MSPC;
++        tCommit *= MSPC;
++        fprintf(stderr, "FRAMESTATS %.1fs frames %d skipped %d rects/frame %.1f damage-kpx/frame %.0f ms/frame clear %.1f clients %.1f end %.1f commit %.1f\n", SECS,
++                frames, skipped, (double)rects / F, damagePx / F / 1000.0, tClear / F, tClients / F, tEnd / F, tCommit / F);
++        *this = SMinixFrameStats();
++    }
++};
++SMinixFrameStats g_minixFrameStats;
++}
++
+ // --------------------------------------------------------- //
+ //   __  __  ____  _   _ _____ _______ ____  _____   _____   //
+ //  |  \/  |/ __ \| \ | |_   _|__   __/ __ \|  __ \ / ____|  //
+@@ -201,6 +254,8 @@
+     g_pCompositor->cleanupFadingOut(PMONITOR->ID);
+ 
+     if (!hasChanged && *PDAMAGETRACKINGMODE != DAMAGE_TRACKING_NONE && PMONITOR->forceFullFrames == 0 && damageBlinkCleanup == 0) {
++        if (g_minixFrameStats.enabled)
++            g_minixFrameStats.skipped++;
+         pixman_region32_fini(&damage);
+         wlr_output_rollback(PMONITOR->output);
+ 
+@@ -246,6 +301,13 @@
+     // TODO: this is getting called with extents being 0,0,0,0 should it be?
+     // potentially can save on resources.
+ 
++    const bool FSTATS = g_minixFrameStats.enabled;
++    if (FSTATS) {
++        g_minixFrameStats.frames++;
++        g_minixFrameStats.damage(&damage);
++        g_minixFrameStats.begin();
++    }
++
+     g_pHyprOpenGL->begin(PMONITOR, &damage);
+ 
+     if (PMONITOR->isMirror()) {
+@@ -254,8 +316,14 @@
+         g_pHyprOpenGL->clear(CColor(17.0 / 255.0, 17.0 / 255.0, 17.0 / 255.0, 1.0));
+         g_pHyprOpenGL->clearWithTex(); // will apply the hypr "wallpaper"
+ 
++        if (FSTATS)
++            g_minixFrameStats.tClear += g_minixFrameStats.section();
++
+         g_pHyprRenderer->renderAllClientsForMonitor(PMONITOR->ID, &now);
+ 
++        if (FSTATS)
++            g_minixFrameStats.tClients += g_minixFrameStats.section();
++
+         // if correct monitor draw hyprerror
+         if (PMONITOR == g_pCompositor->m_vMonitors.front().get())
+             g_pHyprError->draw();
+@@ -285,6 +353,9 @@
+ 
+     g_pHyprOpenGL->end();
+ 
++    if (FSTATS)
++        g_minixFrameStats.tEnd += g_minixFrameStats.section();
++
+     // calc frame damage
+     pixman_region32_t frameDamage;
+     pixman_region32_init(&frameDamage);
+@@ -306,7 +377,14 @@
+     pixman_region32_fini(&frameDamage);
+     pixman_region32_fini(&damage);
+ 
+-    if (!wlr_output_commit(PMONITOR->output))
++    const bool COMMITTED = wlr_output_commit(PMONITOR->output);
++
++    if (FSTATS) {
++        g_minixFrameStats.tCommit += g_minixFrameStats.section(false);
++        g_minixFrameStats.report();
++    }
++
++    if (!COMMITTED)
+         return;
+ 
+     if (*PDAMAGEBLINK || *PVFR == 0)
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' -x wlroots -x hyprland-protocols a/src/events/Windows.cpp b/src/events/Windows.cpp
+--- a/src/events/Windows.cpp	2023-02-21 01:17:31.000000000 +0200
++++ b/src/events/Windows.cpp	2026-11-10 14:06:05.439172984 +0200
+@@ -140,7 +140,7 @@
+                     PMONITOR = g_pCompositor->getMonitorFromID(PWINDOW->m_iMonitorID);
+                 }
+ 
+-                Debug::log(ERR, "Rule monitor, applying to window %x -> mon: %i, workspace: %i", PWINDOW, PWINDOW->m_iMonitorID, PWINDOW->m_iWorkspaceID);
++                Debug::log(ERR, "Rule monitor, applying to window %x -> mon: %i, workspace: %i", PWINDOW, (int)PWINDOW->m_iMonitorID, PWINDOW->m_iWorkspaceID);
+             } catch (std::exception& e) { Debug::log(ERR, "Rule monitor failed, rule: %s -> %s | err: %s", r.szRule.c_str(), r.szValue.c_str(), e.what()); }
+         } else if (r.szRule.find("workspace") == 0) {
+             // check if it isnt unset
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' -x wlroots -x hyprland-protocols a/src/helpers/MiscFunctions.cpp b/src/helpers/MiscFunctions.cpp
+--- a/src/helpers/MiscFunctions.cpp	2023-02-21 01:17:31.000000000 +0200
++++ b/src/helpers/MiscFunctions.cpp	2026-11-10 14:07:53.958349285 +0200
+@@ -507,7 +507,7 @@
+     if (VALUE.find("0x") == 0) {
+         // Values with 0x are hex
+         const auto VALUEWITHOUTHEX = VALUE.substr(2);
+-        return stol(VALUEWITHOUTHEX, nullptr, 16);
++        return std::stoll(VALUEWITHOUTHEX, nullptr, 16); // MINIX/i386: long is 32 bits
+     } else if (VALUE.find("rgba(") == 0 && VALUE.find(')') == VALUE.length() - 1) {
+         const auto VALUEWITHOUTFUNC = VALUE.substr(5, VALUE.length() - 6);
+ 
+@@ -516,7 +516,7 @@
+             throw std::invalid_argument("rgba() expects length of 8 characters (4 bytes)");
+         }
+ 
+-        const auto RGBA = std::stol(VALUEWITHOUTFUNC, nullptr, 16);
++        const auto RGBA = std::stoll(VALUEWITHOUTFUNC, nullptr, 16);
+ 
+         // now we need to RGBA -> ARGB. The config holds ARGB only.
+         return (RGBA >> 8) + 0x1000000 * (RGBA & 0xFF);
+@@ -528,7 +528,7 @@
+             throw std::invalid_argument("rgb() expects length of 6 characters (3 bytes)");
+         }
+ 
+-        const auto RGB = std::stol(VALUEWITHOUTFUNC, nullptr, 16);
++        const auto RGB = std::stoll(VALUEWITHOUTFUNC, nullptr, 16);
+ 
+         return RGB + 0xFF000000; // 0xFF for opaque
+     } else if (VALUE.find("true") == 0 || VALUE.find("on") == 0 || VALUE.find("yes") == 0) {
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' -x wlroots -x hyprland-protocols a/src/helpers/MiscFunctions.hpp b/src/helpers/MiscFunctions.hpp
+--- a/src/helpers/MiscFunctions.hpp	2023-02-21 01:17:31.000000000 +0200
++++ b/src/helpers/MiscFunctions.hpp	2026-11-10 14:05:08.418904464 +0200
+@@ -4,7 +4,7 @@
+ 
+ std::string absolutePath(const std::string&, const std::string&);
+ void        addWLSignal(wl_signal*, wl_listener*, void* pOwner, const std::string& ownerString);
+-std::string getFormat(const char* fmt, ...); // Basically Debug::log to a string
++std::string getFormat(const char* fmt, ...) __attribute__((format(printf, 1, 2))); // Basically Debug::log to a string
+ std::string escapeJSONStrings(const std::string& str);
+ void        scaleBox(wlr_box*, float);
+ std::string removeBeginEndSpacesTabs(std::string);
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' -x wlroots -x hyprland-protocols a/src/helpers/Monitor.cpp b/src/helpers/Monitor.cpp
+--- a/src/helpers/Monitor.cpp	2023-02-21 01:17:31.000000000 +0200
++++ b/src/helpers/Monitor.cpp	2026-11-10 14:06:05.439410444 +0200
+@@ -306,7 +306,7 @@
+ 
+     auto PNEWWORKSPACE = g_pCompositor->getWorkspaceByID(WORKSPACEID);
+ 
+-    Debug::log(LOG, "New monitor: WORKSPACEID %d, exists: %d", WORKSPACEID, (int)(PNEWWORKSPACE != nullptr));
++    Debug::log(LOG, "New monitor: WORKSPACEID %d, exists: %d", (int)WORKSPACEID, (int)(PNEWWORKSPACE != nullptr));
+ 
+     if (PNEWWORKSPACE) {
+         // workspace exists, move it to the newly connected monitor
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' -x wlroots -x hyprland-protocols a/src/layout/DwindleLayout.cpp b/src/layout/DwindleLayout.cpp
+--- a/src/layout/DwindleLayout.cpp	2023-02-21 01:17:31.000000000 +0200
++++ b/src/layout/DwindleLayout.cpp	2026-11-10 14:06:05.439549554 +0200
+@@ -247,7 +247,7 @@
+     } else
+         OPENINGON = getFirstNodeOnWorkspace(pWindow->m_iWorkspaceID);
+ 
+-    Debug::log(LOG, "OPENINGON: %x, Workspace: %i, Monitor: %i", OPENINGON, PNODE->workspaceID, PMONITOR->ID);
++    Debug::log(LOG, "OPENINGON: %x, Workspace: %i, Monitor: %i", OPENINGON, PNODE->workspaceID, (int)PMONITOR->ID);
+ 
+     if (OPENINGON && OPENINGON->workspaceID != PNODE->workspaceID) {
+         // special workspace handling
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' -x wlroots -x hyprland-protocols a/src/main.cpp b/src/main.cpp
+--- a/src/main.cpp	2023-02-21 01:17:31.000000000 +0200
++++ b/src/main.cpp	2026-11-10 14:08:54.767676432 +0200
+@@ -79,6 +79,11 @@
+     for (auto& c : g_pCompositor->m_dProcessPIDsOnShutdown)
+         kill(c, SIGKILL);
+ 
++    // The session lock manager asserts that nothing listens to it any more
++    // when the display goes (upstream left this listener: every clean exit
++    // ended in abort()).
++    wl_list_remove(&Events::listen_newSessionLock.link);
++
+     wl_display_destroy(g_pCompositor->m_sWLDisplay);
+ 
+     return EXIT_SUCCESS;
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' -x wlroots -x hyprland-protocols a/src/managers/EventManager.cpp b/src/managers/EventManager.cpp
+--- a/src/managers/EventManager.cpp	2023-02-21 01:17:31.000000000 +0200
++++ b/src/managers/EventManager.cpp	2026-11-10 13:55:13.897856315 +0200
+@@ -34,50 +34,65 @@
+     return 0;
+ }
+ 
+-void CEventManager::startThread() {
+-    m_tThread = std::thread([&]() {
+-        const auto SOCKET = socket(AF_UNIX, SOCK_STREAM, 0);
++/*
++ * MINIX: threads are cooperative and user-level (libmthread), so a thread
++ * blocked in accept() would stop the whole compositor.  Socket 2 is served
++ * from the Wayland event loop instead: the listening socket is
++ * non-blocking and its readable events accept the clients.
++ */
++static int onSocket2Connection(int fd, uint32_t mask, void* data) {
++    const auto ACCEPTEDFDS = (std::deque<std::pair<int, wl_event_source*>>*)data;
+ 
+-        if (SOCKET < 0) {
+-            Debug::log(ERR, "Couldn't start the Hyprland Socket 2. (1) IPC will not work.");
+-            return;
+-        }
++    if (mask & (WL_EVENT_ERROR | WL_EVENT_HANGUP))
++        return 0;
+ 
+-        sockaddr_un SERVERADDRESS = {.sun_family = AF_UNIX};
+-        std::string socketPath    = "/tmp/hypr/" + g_pCompositor->m_szInstanceSignature + "/.socket2.sock";
+-        strcpy(SERVERADDRESS.sun_path, socketPath.c_str());
++    while (true) {
++        sockaddr_un clientAddress;
++        socklen_t   clientSize = sizeof(clientAddress);
+ 
+-        bind(SOCKET, (sockaddr*)&SERVERADDRESS, SUN_LEN(&SERVERADDRESS));
++        const auto  ACCEPTEDCONNECTION = accept(fd, (sockaddr*)&clientAddress, &clientSize);
+ 
+-        // 10 max queued.
+-        listen(SOCKET, 10);
++        if (ACCEPTEDCONNECTION < 0)
++            break; // EAGAIN: no more pending clients
+ 
+-        sockaddr_in clientAddress;
+-        socklen_t   clientSize = sizeof(clientAddress);
++        // new connection!
++        int flagsNew = fcntl(ACCEPTEDCONNECTION, F_GETFL, 0);
++        fcntl(ACCEPTEDCONNECTION, F_SETFL, flagsNew | O_NONBLOCK);
++        fcntl(ACCEPTEDCONNECTION, F_SETFD, FD_CLOEXEC);
+ 
+-        Debug::log(LOG, "Hypr socket 2 started at %s", socketPath.c_str());
++        Debug::log(LOG, "Socket 2 accepted a new client at FD %d", ACCEPTEDCONNECTION);
+ 
+-        while (1) {
+-            const auto ACCEPTEDCONNECTION = accept(SOCKET, (sockaddr*)&clientAddress, &clientSize);
++        // add to event loop so we can close it when we need to
++        ACCEPTEDFDS->push_back(
++            {ACCEPTEDCONNECTION, wl_event_loop_add_fd(g_pCompositor->m_sWLEventLoop, ACCEPTEDCONNECTION, WL_EVENT_READABLE, fdHandleWrite, ACCEPTEDFDS)});
++    }
+ 
+-            if (ACCEPTEDCONNECTION > 0) {
+-                // new connection!
++    return 0;
++}
+ 
+-                int flagsNew = fcntl(ACCEPTEDCONNECTION, F_GETFL, 0);
+-                fcntl(ACCEPTEDCONNECTION, F_SETFL, flagsNew | O_NONBLOCK);
++void CEventManager::startThread() {
++    const auto SOCKET = socket(AF_UNIX, SOCK_STREAM, 0);
+ 
+-                Debug::log(LOG, "Socket 2 accepted a new client at FD %d", ACCEPTEDCONNECTION);
++    if (SOCKET < 0) {
++        Debug::log(ERR, "Couldn't start the Hyprland Socket 2. (1) IPC will not work.");
++        return;
++    }
+ 
+-                // add to event loop so we can close it when we need to
+-                m_dAcceptedSocketFDs.push_back(
+-                    {ACCEPTEDCONNECTION, wl_event_loop_add_fd(g_pCompositor->m_sWLEventLoop, ACCEPTEDCONNECTION, WL_EVENT_READABLE, fdHandleWrite, &m_dAcceptedSocketFDs)});
+-            }
+-        }
++    sockaddr_un SERVERADDRESS = {.sun_family = AF_UNIX};
++    std::string socketPath    = "/tmp/hypr/" + g_pCompositor->m_szInstanceSignature + "/.socket2.sock";
++    strcpy(SERVERADDRESS.sun_path, socketPath.c_str());
++
++    bind(SOCKET, (sockaddr*)&SERVERADDRESS, SUN_LEN(&SERVERADDRESS));
++
++    // 10 max queued.
++    listen(SOCKET, 10);
+ 
+-        close(SOCKET);
+-    });
++    fcntl(SOCKET, F_SETFL, fcntl(SOCKET, F_GETFL, 0) | O_NONBLOCK);
++    fcntl(SOCKET, F_SETFD, FD_CLOEXEC);
+ 
+-    m_tThread.detach();
++    wl_event_loop_add_fd(g_pCompositor->m_sWLEventLoop, SOCKET, WL_EVENT_READABLE, onSocket2Connection, &m_dAcceptedSocketFDs);
++
++    Debug::log(LOG, "Hypr socket 2 started at %s", socketPath.c_str());
+ }
+ 
+ void CEventManager::flushEvents() {
+@@ -102,14 +117,11 @@
+         return;
+     }
+ 
+-    std::thread(
+-        [&](const SHyprIPCEvent ev) {
+-            eventQueueMutex.lock();
+-            m_dQueuedEvents.push_back(ev);
+-            eventQueueMutex.unlock();
+-
+-            flushEvents();
+-        },
+-        event)
+-        .detach();
++    // MINIX: queue and flush right here (was a detached thread per event;
++    // the client sockets are non-blocking, so this cannot stall).
++    eventQueueMutex.lock();
++    m_dQueuedEvents.push_back(event);
++    eventQueueMutex.unlock();
++
++    flushEvents();
+ }
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' -x wlroots -x hyprland-protocols a/src/managers/KeybindManager.cpp b/src/managers/KeybindManager.cpp
+--- a/src/managers/KeybindManager.cpp	2023-02-21 01:17:31.000000000 +0200
++++ b/src/managers/KeybindManager.cpp	2026-11-10 14:06:05.440168443 +0200
+@@ -1557,9 +1557,9 @@
+     }
+ 
+     if (requestedWorkspaceIsAlreadyOpen && specialOpenOnMonitor == workspaceID)
+-        Debug::log(LOG, "Toggling special workspace %d to closed");
++        Debug::log(LOG, "Toggling special workspace %d to closed", workspaceID);
+     else
+-        Debug::log(LOG, "Toggling special workspace %d to open");
++        Debug::log(LOG, "Toggling special workspace %d to open", workspaceID);
+ 
+     if (requestedWorkspaceIsAlreadyOpen && specialOpenOnMonitor == workspaceID) {
+         // already open on this monitor
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' -x wlroots -x hyprland-protocols a/src/meson.build b/src/meson.build
+--- a/src/meson.build	2023-02-21 01:17:31.000000000 +0200
++++ b/src/meson.build	2026-11-10 13:53:36.998515937 +0200
+@@ -18,7 +18,8 @@
+     systemd_dep,
+ 
+     dependency('pixman-1'),
+-    dependency('gl', 'opengl'),
++    # MINIX: no desktop GL/glvnd (Mesa's EGL + GLESv2 only, which is all
++    # Hyprland uses).
+     dependency('threads')
+   ],
+   install : true
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' -x wlroots -x hyprland-protocols a/src/render/OpenGL.cpp b/src/render/OpenGL.cpp
+--- a/src/render/OpenGL.cpp	2023-02-21 01:17:31.000000000 +0200
++++ b/src/render/OpenGL.cpp	2026-11-10 16:39:22.438079148 +0200
+@@ -129,8 +129,19 @@
+     if (!m_RenderData.pCurrentMonData->m_bShadersInitialized)
+         initShaders();
+ 
++    // MINIX (software rendering): render straight into the output buffer
++    // when nothing needs the primary framebuffer's copy (blur, a screen
++    // shader, mirroring, a rotated output) - saves a full-screen textured
++    // pass per frame.  The damage is already the buffer's (buffer age).
++    // HYPRLAND_MINIX_NODIRECT=1 disables this.
++    static const bool  DIRECTOK     = !getenv("HYPRLAND_MINIX_NODIRECT");
++    static auto* const PBLURENABLED = &g_pConfigManager->getConfigValuePtr("decoration:blur")->intValue;
++    m_bDirectRender = DIRECTOK && !fake && *PBLURENABLED == 0 && !m_bReloadScreenShader && m_sFinalScreenShader.program == 0 && pMonitor->mirrors.empty() &&
++        !pMonitor->isMirror() && pMonitor->transform == WL_OUTPUT_TRANSFORM_NORMAL;
++
+     // bind the primary Hypr Framebuffer
+-    m_RenderData.pCurrentMonData->primaryFB.bind();
++    if (!m_bDirectRender)
++        m_RenderData.pCurrentMonData->primaryFB.bind();
+ 
+     m_RenderData.pDamage = pDamage;
+ 
+@@ -144,7 +155,7 @@
+ 
+ void CHyprOpenGLImpl::end() {
+     // end the render, copy the data to the WLR framebuffer
+-    if (!m_bFakeFrame) {
++    if (!m_bFakeFrame && !m_bDirectRender) {
+         pixman_region32_copy(m_RenderData.pDamage, &m_rOriginalDamageRegion);
+ 
+         if (!m_RenderData.pMonitor->mirrors.empty())
+@@ -167,6 +178,7 @@
+     // reset our data
+     m_RenderData.pMonitor = nullptr;
+     m_iWLROutputFb        = 0;
++    m_bDirectRender       = false;
+ }
+ 
+ void CHyprOpenGLImpl::initShaders() {
+@@ -210,6 +222,24 @@
+     m_RenderData.pCurrentMonData->m_shRGBX.applyTint            = glGetUniformLocation(prog, "applyTint");
+     m_RenderData.pCurrentMonData->m_shRGBX.tint                 = glGetUniformLocation(prog, "tint");
+ 
++    for (int fast = 0; fast < 2; fast++) {
++        CShader* sh = fast ? &m_RenderData.pCurrentMonData->m_shRGBXFAST : &m_RenderData.pCurrentMonData->m_shRGBAFAST;
++        prog        = createProgram(TEXVERTSRC, fast ? TEXFRAGSRCRGBX_FAST : TEXFRAGSRCRGBA_FAST);
++        sh->program              = prog;
++        sh->proj                 = glGetUniformLocation(prog, "proj");
++        sh->tex                  = glGetUniformLocation(prog, "tex");
++        sh->alpha                = glGetUniformLocation(prog, "alpha");
++        sh->texAttrib            = glGetAttribLocation(prog, "texcoord");
++        sh->posAttrib            = glGetAttribLocation(prog, "pos");
++        sh->discardOpaque        = -1;
++        sh->topLeft              = -1;
++        sh->fullSize             = -1;
++        sh->radius               = -1;
++        sh->primitiveMultisample = -1;
++        sh->applyTint            = -1;
++        sh->tint                 = -1;
++    }
++
+     prog                                                       = createProgram(TEXVERTSRC, TEXFRAGSRCEXT);
+     m_RenderData.pCurrentMonData->m_shEXT.program              = prog;
+     m_RenderData.pCurrentMonData->m_shEXT.tex                  = glGetUniformLocation(prog, "tex");
+@@ -484,19 +514,32 @@
+     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+ 
+     bool usingFinalShader = false;
++    bool fastShader       = false;
+ 
+     if (m_bApplyFinalShader && m_sFinalScreenShader.program) {
+         shader           = &m_sFinalScreenShader;
+         usingFinalShader = true;
+     } else {
++        // MINIX: the plain shaders when rounding, dimming and discardOpaque
++        // are all off (HYPRLAND_MINIX_NOFASTSHADER=1 disables this).  The
++        // full shaders only round for radius > 0 - and windows come with
++        // rounding - 1 (Renderer.cpp: "to fix a border issue"), i.e. -1.
++        static const bool FASTOK = !getenv("HYPRLAND_MINIX_NOFASTSHADER");
++        const bool        DIM = allowDim && m_pCurrentWindow && *PDIMINACTIVE && m_pCurrentWindow != g_pCompositor->m_pLastWindow;
++        const bool        FAST = FASTOK && round <= 0 && !discardOpaque && !DIM;
++        fastShader             = FAST;
+         switch (tex.m_iType) {
+-            case TEXTURE_RGBA: shader = &m_RenderData.pCurrentMonData->m_shRGBA; break;
+-            case TEXTURE_RGBX: shader = &m_RenderData.pCurrentMonData->m_shRGBX; break;
++            case TEXTURE_RGBA: shader = FAST ? &m_RenderData.pCurrentMonData->m_shRGBAFAST : &m_RenderData.pCurrentMonData->m_shRGBA; break;
++            case TEXTURE_RGBX: shader = FAST ? &m_RenderData.pCurrentMonData->m_shRGBXFAST : &m_RenderData.pCurrentMonData->m_shRGBX; break;
+             case TEXTURE_EXTERNAL: shader = &m_RenderData.pCurrentMonData->m_shEXT; break;
+             default: RASSERT(false, "tex.m_iTarget unsupported!");
+         }
+     }
+ 
++    // MINIX: an opaque, unscaled texture is a plain copy - no shader.
++    if (fastShader && alpha >= 1.f && minixTryBlit(tex, pBox, damage, allowCustomUV))
++        return;
++
+     glActiveTexture(GL_TEXTURE0);
+     glBindTexture(tex.m_iTarget, tex.m_iTexID);
+ 
+@@ -931,6 +974,123 @@
+     counter++;
+ }
+ 
++// MINIX (software rendering): draw an opaque texture that maps 1:1 onto the
++// framebuffer with glBlitFramebuffer (GLES 3) instead of a textured quad.
++// Without scaling, filtering, scissor or blending, Mesa turns the blit into
++// a resource copy (memcpy per row) - softpipe would otherwise interpret the
++// fragment shader for every pixel.  Hyprland's FBOs share one convention
++// (layout y == framebuffer y == texture row, see scissor()), so the damage
++// rectangles are the blit rectangles.  Direct frames only (see below).
++// HYPRLAND_MINIX_NOBLIT=1 disables it.
++#ifndef GL_READ_FRAMEBUFFER
++#define GL_READ_FRAMEBUFFER 0x8CA8
++#endif
++#ifndef GL_DRAW_FRAMEBUFFER_BINDING
++#define GL_DRAW_FRAMEBUFFER_BINDING 0x8CA6
++#endif
++#ifndef GL_READ_FRAMEBUFFER_BINDING
++#define GL_READ_FRAMEBUFFER_BINDING 0x8CAA
++#endif
++typedef void (*PFNMINIXBLITFRAMEBUFFER)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
++
++bool CHyprOpenGLImpl::minixTryBlit(const CTexture& tex, wlr_box* pBox, pixman_region32_t* damage, bool allowCustomUV) {
++    static const bool                    BLITOK = !getenv("HYPRLAND_MINIX_NOBLIT");
++    static const PFNMINIXBLITFRAMEBUFFER BLIT   = (PFNMINIXBLITFRAMEBUFFER)eglGetProcAddress("glBlitFramebuffer");
++
++    if (!BLITOK || !BLIT || m_bMinixBlitBroken || tex.m_iTarget != GL_TEXTURE_2D || m_bEndFrame || m_RenderData.pMonitor->transform != WL_OUTPUT_TRANSFORM_NORMAL)
++        return false;
++
++    if (tex.m_iType != TEXTURE_RGBX && !m_bMinixSurfaceOpaque)
++        return false;
++
++    if (pBox->width != (int)tex.m_vSize.x || pBox->height != (int)tex.m_vSize.y)
++        return false;
++
++    if (allowCustomUV && m_RenderData.primarySurfaceUVTopLeft != Vector2D(-1, -1) &&
++        (m_RenderData.primarySurfaceUVTopLeft != Vector2D(0, 0) || m_RenderData.primarySurfaceUVBottomRight != Vector2D(1, 1)))
++        return false;
++
++    GLint drawFb = 0, readFb = 0;
++    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFb);
++    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFb);
++    // Only straight into the (XRGB) output buffer: a copy also carries the
++    // client's alpha byte - undefined for XRGB buffers - which an RGBA
++    // framebuffer (primaryFB, snapshots) would later blend with.
++    if (!m_bDirectRender || drawFb == 0 || drawFb != m_iCurrentOutputFb)
++        return false;
++
++    if (!m_iMinixBlitFb)
++        glGenFramebuffers(1, &m_iMinixBlitFb);
++
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_iMinixBlitFb);
++    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex.m_iTexID, 0);
++
++    bool ok = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
++    if (ok) {
++        pixman_region32_t region;
++        pixman_region32_init_rect(&region, pBox->x, pBox->y, pBox->width, pBox->height);
++        pixman_region32_intersect(&region, &region, damage);
++        if (m_RenderData.clipBox.width != 0 && m_RenderData.clipBox.height != 0)
++            pixman_region32_intersect_rect(&region, &region, m_RenderData.clipBox.x, m_RenderData.clipBox.y, m_RenderData.clipBox.width, m_RenderData.clipBox.height);
++
++        glDisable(GL_SCISSOR_TEST); // a scissored blit is no copy
++        PIXMAN_DAMAGE_FOREACH(&region) {
++            const auto R = RECTSARR[i];
++            BLIT(R.x1 - pBox->x, R.y1 - pBox->y, R.x2 - pBox->x, R.y2 - pBox->y, R.x1, R.y1, R.x2, R.y2, GL_COLOR_BUFFER_BIT, GL_NEAREST);
++        }
++        pixman_region32_fini(&region);
++
++        if (const auto GLERR = glGetError(); GLERR != GL_NO_ERROR) {
++            Debug::log(ERR, "MINIX: glBlitFramebuffer failed (0x%x), using textured quads from now on", GLERR);
++            m_bMinixBlitBroken = true;
++            ok                 = false;
++        } else {
++            static bool logged = false;
++            if (!logged) {
++                logged = true;
++                Debug::log(LOG, "MINIX: opaque textures are blitted");
++                fprintf(stderr, "MINIX: opaque textures are blitted\n");
++            }
++        }
++    }
++
++    // do not keep the client's texture attached (it would outlive deletion)
++    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, readFb);
++    return ok;
++}
++
++// MINIX (software rendering): the border shader covers the whole window box
++// and discards the inside; scissor it to the four border strips (thick
++// enough for rounded corners) so only border pixels run the shader.
++// HYPRLAND_MINIX_NOBORDERSCISSOR=1 draws the whole box as before.
++void CHyprOpenGLImpl::drawBorderStrips(const pixman_box32& damage, const wlr_box& box, int thick) {
++    static const bool STRIPSOK = !getenv("HYPRLAND_MINIX_NOBORDERSCISSOR");
++
++    if (!STRIPSOK || m_RenderData.pMonitor->transform != WL_OUTPUT_TRANSFORM_NORMAL || thick * 2 >= box.width || thick * 2 >= box.height) {
++        scissor(&damage);
++        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++        return;
++    }
++
++    const wlr_box strips[4] = {
++        {box.x, box.y, box.width, thick},                                      // top
++        {box.x, box.y + box.height - thick, box.width, thick},                 // bottom
++        {box.x, box.y + thick, thick, box.height - 2 * thick},                 // left
++        {box.x + box.width - thick, box.y + thick, thick, box.height - 2 * thick}, // right
++    };
++
++    const wlr_box damageRect = {damage.x1, damage.y1, damage.x2 - damage.x1, damage.y2 - damage.y1};
++
++    for (const auto& strip : strips) {
++        wlr_box clipped;
++        if (!wlr_box_intersection(&clipped, &strip, &damageRect))
++            continue;
++        scissor(&clipped);
++        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++    }
++}
++
+ void CHyprOpenGLImpl::renderBorder(wlr_box* box, const CGradientValueData& grad, int round, float a) {
+     RASSERT((box->width > 0 && box->height > 0), "Tried to render rect with width/height < 0!");
+     RASSERT(m_RenderData.pMonitor, "Tried to render rect without begin()!");
+@@ -1008,8 +1168,7 @@
+         if (pixman_region32_not_empty(&damageClip)) {
+             PIXMAN_DAMAGE_FOREACH(&damageClip) {
+                 const auto RECT = RECTSARR[i];
+-                scissor(&RECT);
+-                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++                drawBorderStrips(RECT, *box, scaledBorderSize + round);
+             }
+         }
+ 
+@@ -1017,8 +1176,7 @@
+     } else {
+         PIXMAN_DAMAGE_FOREACH(m_RenderData.pDamage) {
+             const auto RECT = RECTSARR[i];
+-            scissor(&RECT);
+-            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++            drawBorderStrips(RECT, *box, scaledBorderSize + round);
+         }
+     }
+ 
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' -x wlroots -x hyprland-protocols a/src/render/OpenGL.hpp b/src/render/OpenGL.hpp
+--- a/src/render/OpenGL.hpp	2023-02-21 01:17:31.000000000 +0200
++++ b/src/render/OpenGL.hpp	2026-11-10 16:32:21.469393563 +0200
+@@ -42,6 +42,8 @@
+     CShader m_shQUAD;
+     CShader m_shRGBA;
+     CShader m_shRGBX;
++    CShader m_shRGBAFAST; // MINIX: no rounding/tint/discard (see Textures.hpp)
++    CShader m_shRGBXFAST;
+     CShader m_shEXT;
+     CShader m_shBLUR1;
+     CShader m_shBLUR2;
+@@ -92,6 +94,8 @@
+     void                                       scissor(const wlr_box*, bool transform = true);
+     void                                       scissor(const pixman_box32*, bool transform = true);
+     void                                       scissor(const int x, const int y, const int w, const int h, bool transform = true);
++    void                                       drawBorderStrips(const pixman_box32& damage, const wlr_box& box, int thick); // MINIX
++    bool                                       minixTryBlit(const CTexture& tex, wlr_box* pBox, pixman_region32_t* damage, bool allowCustomUV); // MINIX
+ 
+     void                                       destroyMonitorResources(CMonitor*);
+ 
+@@ -116,6 +120,7 @@
+     bool                                       m_bReloadScreenShader = true; // at launch it can be set
+ 
+     CWindow*                                   m_pCurrentWindow = nullptr; // hack to get the current rendered window
++    bool                                       m_bMinixSurfaceOpaque = false; // MINIX: renderSurface: the surface's opaque region covers it
+ 
+     pixman_region32_t                          m_rOriginalDamageRegion; // used for storing the pre-expanded region
+ 
+@@ -133,6 +138,9 @@
+ 
+     bool              m_bFakeFrame        = false;
+     bool              m_bEndFrame         = false;
++    bool              m_bDirectRender     = false; // MINIX: no primaryFB pass this frame
++    GLuint            m_iMinixBlitFb        = 0;     // MINIX: read framebuffer for minixTryBlit
++    bool              m_bMinixBlitBroken    = false;
+     bool              m_bApplyFinalShader = false;
+ 
+     CShader           m_sFinalScreenShader;
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' -x wlroots -x hyprland-protocols a/src/render/Renderer.cpp b/src/render/Renderer.cpp
+--- a/src/render/Renderer.cpp	2023-02-21 01:17:31.000000000 +0200
++++ b/src/render/Renderer.cpp	2026-11-10 16:31:44.902971758 +0200
+@@ -36,6 +36,12 @@
+ 
+     rounding -= 1; // to fix a border issue
+ 
++    // MINIX: an ARGB buffer whose opaque region covers the whole surface can
++    // be copied instead of blended (CHyprOpenGLImpl::minixTryBlit).
++    pixman_box32_t surfBox                  = {0, 0, surface->current.width, surface->current.height};
++    g_pHyprOpenGL->m_bMinixSurfaceOpaque    = surface->current.width > 0 && surface->current.height > 0 &&
++        pixman_region32_contains_rectangle(&surface->opaque_region, &surfBox) == PIXMAN_REGION_IN;
++
+     if (RDATA->surface && surface == RDATA->surface) {
+         if (wlr_xwayland_surface_try_from_wlr_surface(surface) && !wlr_xwayland_surface_try_from_wlr_surface(surface)->has_alpha && RDATA->fadeAlpha * RDATA->alpha == 1.f) {
+             g_pHyprOpenGL->renderTexture(TEXTURE, &windowBox, RDATA->fadeAlpha * RDATA->alpha, rounding, true);
+@@ -54,6 +60,8 @@
+         wlr_presentation_surface_sampled_on_output(g_pCompositor->m_sWLRPresentation, surface, RDATA->pMonitor->output);
+     }
+ 
++    g_pHyprOpenGL->m_bMinixSurfaceOpaque = false;
++
+     // reset the UV, we might've set it above
+     g_pHyprOpenGL->m_RenderData.primarySurfaceUVTopLeft     = Vector2D(-1, -1);
+     g_pHyprOpenGL->m_RenderData.primarySurfaceUVBottomRight = Vector2D(-1, -1);
+@@ -1268,7 +1276,7 @@
+                     const auto PREFERREDMODE = wlr_output_preferred_mode(pMonitor->output);
+ 
+                     if (!PREFERREDMODE) {
+-                        Debug::log(ERR, "Monitor %s has NO PREFERRED MODE, and an INVALID one was requested: %ix%i@%2f", (int)pMonitorRule->resolution.x,
++                        Debug::log(ERR, "Monitor %s has NO PREFERRED MODE, and an INVALID one was requested: %ix%i@%2f", pMonitor->szName.c_str(), (int)pMonitorRule->resolution.x,
+                                    (int)pMonitorRule->resolution.y, (float)pMonitorRule->refreshRate);
+                         return true;
+                     }
+@@ -1298,7 +1306,7 @@
+                 const auto PREFERREDMODE = wlr_output_preferred_mode(pMonitor->output);
+ 
+                 if (!PREFERREDMODE) {
+-                    Debug::log(ERR, "Monitor %s has NO PREFERRED MODE, and an INVALID one was requested: %ix%i@%2f", (int)pMonitorRule->resolution.x,
++                    Debug::log(ERR, "Monitor %s has NO PREFERRED MODE, and an INVALID one was requested: %ix%i@%2f", pMonitor->szName.c_str(), (int)pMonitorRule->resolution.x,
+                                (int)pMonitorRule->resolution.y, (float)pMonitorRule->refreshRate);
+                     return true;
+                 }
+@@ -1360,7 +1368,7 @@
+                 const auto PREFERREDMODE = wlr_output_preferred_mode(pMonitor->output);
+ 
+                 if (!PREFERREDMODE) {
+-                    Debug::log(ERR, "Monitor %s has NO PREFERRED MODE, and an INVALID one was requested: %ix%i@%2f", (int)pMonitorRule->resolution.x,
++                    Debug::log(ERR, "Monitor %s has NO PREFERRED MODE, and an INVALID one was requested: %ix%i@%2f", pMonitor->szName.c_str(), (int)pMonitorRule->resolution.x,
+                                (int)pMonitorRule->resolution.y, (float)pMonitorRule->refreshRate);
+                     return true;
+                 }
+@@ -1387,7 +1395,7 @@
+         const auto PREFERREDMODE = wlr_output_preferred_mode(pMonitor->output);
+ 
+         if (!PREFERREDMODE) {
+-            Debug::log(ERR, "Monitor %s has NO PREFERRED MODE", (int)pMonitorRule->resolution.x, (int)pMonitorRule->resolution.y, (float)pMonitorRule->refreshRate);
++            Debug::log(ERR, "Monitor %s has NO PREFERRED MODE", pMonitor->szName.c_str());
+ 
+             if (!wl_list_empty(&pMonitor->output->modes)) {
+                 wlr_output_mode* mode;
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' -x wlroots -x hyprland-protocols a/src/render/shaders/Textures.hpp b/src/render/shaders/Textures.hpp
+--- a/src/render/shaders/Textures.hpp	2023-02-21 01:17:31.000000000 +0200
++++ b/src/render/shaders/Textures.hpp	2026-11-10 14:59:01.053343139 +0200
+@@ -122,6 +122,29 @@
+     gl_FragColor = pixColor * alpha;
+ })#";
+ 
++// MINIX (software rendering): variants without rounding, tint and
++// discardOpaque, used when none of them applies - Mesa's softpipe interprets
++// every instruction for every pixel.
++inline const std::string TEXFRAGSRCRGBA_FAST = R"#(
++precision mediump float;
++varying vec2 v_texcoord;
++uniform sampler2D tex;
++uniform float alpha;
++
++void main() {
++    gl_FragColor = texture2D(tex, v_texcoord) * alpha;
++})#";
++
++inline const std::string TEXFRAGSRCRGBX_FAST = R"#(
++precision mediump float;
++varying vec2 v_texcoord;
++uniform sampler2D tex;
++uniform float alpha;
++
++void main() {
++    gl_FragColor = vec4(texture2D(tex, v_texcoord).rgb, 1.0) * alpha;
++})#";
++
+ inline const std::string TEXFRAGSRCRGBX = R"#(
+ precision mediump float;
+ varying vec2 v_texcoord;

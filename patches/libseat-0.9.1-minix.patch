@@ -1,0 +1,50 @@
+diff -ruN a/libseat/libseat.c b/libseat/libseat.c
+--- a/libseat/libseat.c	2024-10-30 21:43:26.000000000 +0200
++++ b/libseat/libseat.c	2026-11-07 08:33:01.204715411 +0200
+@@ -30,7 +30,8 @@
+ 	{NULL, NULL},
+ };
+ 
+-#if !defined(SEATD_ENABLED) && !defined(LOGIND_ENABLED) && !defined(BUILTIN_ENABLED)
++/* MINIX: the no-op backend alone is the intended configuration. */
++#if !defined(SEATD_ENABLED) && !defined(LOGIND_ENABLED) && !defined(BUILTIN_ENABLED) && !defined(__minix)
+ #error At least one backend must be enabled
+ #endif
+ 
+@@ -65,9 +66,13 @@
+ 
+ 	struct libseat *backend = NULL;
+ 	for (const struct named_backend *iter = impls; iter->backend != NULL; iter++) {
++#ifndef __minix
++		/* MINIX has no seat manager: the no-op backend (direct device
++		 * access) is the one to use, also without LIBSEAT_BACKEND. */
+ 		if (iter->backend == &noop_impl) {
+ 			continue;
+ 		}
++#endif
+ 		backend = iter->backend->open_seat(listener, data);
+ 		if (backend != NULL) {
+ 			log_infof("Seat opened with backend '%s'", iter->name);
+diff -ruN a/meson.build b/meson.build
+--- a/meson.build	2024-10-30 21:43:26.000000000 +0200
++++ b/meson.build	2026-11-07 08:33:01.204821321 +0200
+@@ -159,7 +159,7 @@
+ endif
+ 
+ # needed for cross-compilation
+-realtime = meson.get_compiler('c').find_library('rt')
++realtime = meson.get_compiler('c').find_library('rt', required : false)	# MINIX: in libc
+ private_deps += realtime
+ 
+ if with_builtin
+@@ -247,6 +247,10 @@
+ 	'connection': ['common/connection.c'],
+ 	'poller': ['common/linked_list.c', 'seatd/poller.c'],
+ }
++# MINIX: no seatd server, and the poller test needs real-time signals.
++if host_machine.system() == 'minix'
++	tests = {}
++endif
+ 
+ foreach name, value : tests
+ 	test(name, executable(

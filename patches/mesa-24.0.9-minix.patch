@@ -1,0 +1,351 @@
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/meson.build b/meson.build
+--- a/meson.build	2024-06-06 20:57:27.000000000 +0200
++++ b/meson.build	2026-11-08 07:15:39.867042810 +0200
+@@ -128,7 +128,7 @@
+ # Only build shared_glapi if at least one OpenGL API is enabled
+ with_shared_glapi = with_shared_glapi and with_any_opengl
+ 
+-system_has_kms_drm = ['openbsd', 'netbsd', 'freebsd', 'gnu/kfreebsd', 'dragonfly', 'linux', 'sunos', 'android', 'managarm'].contains(host_machine.system())
++system_has_kms_drm = ['openbsd', 'netbsd', 'freebsd', 'gnu/kfreebsd', 'dragonfly', 'linux', 'sunos', 'android', 'managarm', 'minix'].contains(host_machine.system())
+ 
+ gallium_drivers = get_option('gallium-drivers')
+ if gallium_drivers.contains('auto')
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/src/c11/impl/threads_posix.c b/src/c11/impl/threads_posix.c
+--- a/src/c11/impl/threads_posix.c	2024-06-06 20:57:27.000000000 +0200
++++ b/src/c11/impl/threads_posix.c	2026-11-08 07:18:21.862726650 +0200
+@@ -43,7 +43,7 @@
+     Use pthread_mutex_timedlock() for `mtx_timedlock()'
+     Otherwise use mtx_trylock() + *busy loop* emulation.
+ */
+-#if !defined(__CYGWIN__) && !defined(__APPLE__) && !defined(__NetBSD__)
++#if !defined(__CYGWIN__) && !defined(__APPLE__) && !defined(__NetBSD__) && !defined(__minix)
+ #define EMULATED_THREADS_USE_NATIVE_TIMEDLOCK
+ #endif
+ 
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/src/gallium/auxiliary/hud/hud_context.c b/src/gallium/auxiliary/hud/hud_context.c
+--- a/src/gallium/auxiliary/hud/hud_context.c	2024-06-06 20:57:27.000000000 +0200
++++ b/src/gallium/auxiliary/hud/hud_context.c	2026-11-08 07:26:45.584043550 +0200
+@@ -79,7 +79,7 @@
+ static int hud_rotate = HUD_DEFAULT_ROTATION;
+ static float hud_opacity = HUD_DEFAULT_OPACITY / 100.0f;
+ 
+-#if DETECT_OS_UNIX
++#if DETECT_OS_UNIX && defined(SA_SIGINFO)
+ static void
+ signal_visible_handler(int sig, siginfo_t *siginfo, void *context)
+ {
+@@ -1942,7 +1942,7 @@
+    }
+    const char *env = debug_get_option("GALLIUM_HUD",
+       emulate_libgl_show_fps ? "stdout,fps" : NULL);
+-#if DETECT_OS_UNIX
++#if DETECT_OS_UNIX && defined(SA_SIGINFO)
+    unsigned signo = debug_get_num_option("GALLIUM_HUD_TOGGLE_SIGNAL", 0);
+    static bool sig_handled = false;
+    struct sigaction action;
+@@ -2033,7 +2033,7 @@
+    list_inithead(&hud->pane_list);
+ 
+    /* setup sig handler once for all hud contexts */
+-#if DETECT_OS_UNIX
++#if DETECT_OS_UNIX && defined(SA_SIGINFO)
+    if (!sig_handled && signo != 0) {
+       action.sa_sigaction = &signal_visible_handler;
+       action.sa_flags = SA_SIGINFO;
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/src/gallium/auxiliary/util/u_screen.c b/src/gallium/auxiliary/util/u_screen.c
+--- a/src/gallium/auxiliary/util/u_screen.c	2024-06-06 20:57:27.000000000 +0200
++++ b/src/gallium/auxiliary/util/u_screen.c	2026-11-10 11:19:08.730274158 +0200
+@@ -440,7 +440,7 @@
+       return 0;
+ 
+    case PIPE_CAP_DMABUF:
+-#if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_MANAGARM)
++#if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_MANAGARM || DETECT_OS_MINIX)
+       fd = pscreen->get_screen_fd(pscreen);
+       if (fd != -1 && (drmGetCap(fd, DRM_CAP_PRIME, &cap) == 0))
+          return cap;
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/src/gallium/drivers/softpipe/sp_clear.c b/src/gallium/drivers/softpipe/sp_clear.c
+--- a/src/gallium/drivers/softpipe/sp_clear.c	2024-06-06 20:57:27.000000000 +0200
++++ b/src/gallium/drivers/softpipe/sp_clear.c	2026-11-10 16:28:04.836536299 +0200
+@@ -33,6 +33,7 @@
+ 
+ 
+ #include "pipe/p_defines.h"
++#include "draw/draw_context.h"
+ #include "util/u_pack_color.h"
+ #include "util/u_surface.h"
+ #include "sp_clear.h"
+@@ -43,8 +44,52 @@
+ 
+ 
+ /**
++ * MINIX: clear a scissor rectangle (PIPE_CAP_CLEAR_SCISSORED).  The tile
++ * caches are written back and emptied first (sp_flush_tile_cache marks
++ * every tile invalid), then the rectangle is filled in the surfaces
++ * themselves, so later rendering re-reads the cleared pixels.
++ */
++static void
++softpipe_clear_scissored(struct softpipe_context *softpipe, unsigned buffers,
++                         const struct pipe_scissor_state *s,
++                         const union pipe_color_union *color,
++                         double depth, unsigned stencil)
++{
++   struct pipe_context *pipe = &softpipe->pipe;
++   struct pipe_surface *zsbuf = softpipe->framebuffer.zsbuf;
++   unsigned zs_buffers = buffers & PIPE_CLEAR_DEPTHSTENCIL;
++   unsigned w = s->maxx - s->minx, h = s->maxy - s->miny;
++   uint i;
++
++   if (s->minx >= s->maxx || s->miny >= s->maxy)
++      return;
++
++   /* Primitives still queued in the draw module go before the clear. */
++   draw_flush(softpipe->draw);
++
++   if (buffers & PIPE_CLEAR_COLOR) {
++      for (i = 0; i < softpipe->framebuffer.nr_cbufs; i++) {
++         struct pipe_surface *cbuf = softpipe->framebuffer.cbufs[i];
++         if (!(buffers & (PIPE_CLEAR_COLOR0 << i)) || !cbuf)
++            continue;
++         sp_flush_tile_cache(softpipe->cbuf_cache[i]);
++         util_clear_render_target(pipe, cbuf, color, s->minx, s->miny, w, h);
++      }
++   }
++
++   if (zs_buffers && zsbuf) {
++      sp_flush_tile_cache(softpipe->zsbuf_cache);
++      util_clear_depth_stencil(pipe, zsbuf, zs_buffers, depth, stencil,
++                               s->minx, s->miny, w, h);
++   }
++
++   softpipe->dirty_render_cache = true;
++}
++
++
++/**
+  * Clear the given buffers to the specified values.
+- * No masking, no scissor (clear entire buffer).
++ * No masking; a scissor only with PIPE_CAP_CLEAR_SCISSORED (MINIX).
+  */
+ void
+ softpipe_clear(struct pipe_context *pipe, unsigned buffers,
+@@ -64,6 +109,12 @@
+    if (!softpipe_check_render_cond(softpipe))
+       return;
+ 
++   if (scissor_state) {
++      softpipe_clear_scissored(softpipe, buffers, scissor_state, color,
++                               depth, stencil);
++      return;
++   }
++
+ #if 0
+    softpipe_update_derived(softpipe, MESA_PRIM_TRIANGLES); /* not needed?? */
+ #endif
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/src/gallium/drivers/softpipe/sp_screen.c b/src/gallium/drivers/softpipe/sp_screen.c
+--- a/src/gallium/drivers/softpipe/sp_screen.c	2024-06-06 20:57:27.000000000 +0200
++++ b/src/gallium/drivers/softpipe/sp_screen.c	2026-11-10 16:27:50.957215981 +0200
+@@ -309,6 +309,12 @@
+       return 4;
+    case PIPE_CAP_IMAGE_STORE_FORMATTED:
+       return 1;
++   case PIPE_CAP_CLEAR_SCISSORED:
++      /* MINIX: softpipe_clear() fills the scissor rectangle directly;
++       * otherwise the state tracker draws a quad through the shader
++       * interpreter (a compositor clears its damage this way every frame).
++       */
++      return 1;
+    default:
+       return u_pipe_screen_get_param_defaults(screen, param);
+    }
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/src/gallium/winsys/sw/kms-dri/kms_dri_sw_winsys.c b/src/gallium/winsys/sw/kms-dri/kms_dri_sw_winsys.c
+--- a/src/gallium/winsys/sw/kms-dri/kms_dri_sw_winsys.c	2024-06-06 20:57:27.000000000 +0200
++++ b/src/gallium/winsys/sw/kms-dri/kms_dri_sw_winsys.c	2026-11-10 11:19:14.801357699 +0200
+@@ -43,6 +43,7 @@
+ #include <xf86drm.h>
+ 
+ #include "util/compiler.h"
++#include "util/detect_os.h"
+ #include "util/format/u_formats.h"
+ #include "pipe/p_state.h"
+ #include "util/u_inlines.h"
+@@ -345,11 +346,21 @@
+       return NULL;
+ 
+    list_inithead(&kms_sw_dt->planes);
++#if DETECT_OS_MINIX
++   /* MINIX dma-buf fds are character devices: lseek() cannot size them. */
++   uint64_t dmabuf_size;
++   if (drmMinixDmabufSize(fd, &dmabuf_size) != 0) {
++      FREE(kms_sw_dt);
++      return NULL;
++   }
++   off_t lseek_ret = (off_t)dmabuf_size;
++#else
+    off_t lseek_ret = lseek(fd, 0, SEEK_END);
+    if (lseek_ret == -1) {
+       FREE(kms_sw_dt);
+       return NULL;
+    }
++#endif
+    kms_sw_dt->mapped = MAP_FAILED;
+    kms_sw_dt->ro_mapped = MAP_FAILED;
+    kms_sw_dt->size = lseek_ret;
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/src/util/detect_os.h b/src/util/detect_os.h
+--- a/src/util/detect_os.h	2024-06-06 20:57:27.000000000 +0200
++++ b/src/util/detect_os.h	2026-11-08 07:22:15.624619148 +0200
+@@ -86,6 +86,11 @@
+ #define DETECT_OS_UNIX 1
+ #endif
+ 
++#if defined(__minix)
++#define DETECT_OS_MINIX 1
++#define DETECT_OS_UNIX 1
++#endif
++
+ 
+ /*
+  * Make sure DETECT_OS_* are always defined, so that they can be used with #if
+@@ -135,5 +140,8 @@
+ #ifndef DETECT_OS_MANAGARM
+ #define DETECT_OS_MANAGARM 0
+ #endif
++#ifndef DETECT_OS_MINIX
++#define DETECT_OS_MINIX 0
++#endif
+ 
+ #endif /* DETECT_OS_H */
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/src/util/os_misc.c b/src/util/os_misc.c
+--- a/src/util/os_misc.c	2024-06-06 20:57:27.000000000 +0200
++++ b/src/util/os_misc.c	2026-11-08 07:22:15.624674628 +0200
+@@ -57,7 +57,7 @@
+ #  include <unistd.h>
+ #  include <log/log.h>
+ #  include <cutils/properties.h>
+-#elif DETECT_OS_LINUX || DETECT_OS_CYGWIN || DETECT_OS_SOLARIS || DETECT_OS_HURD || DETECT_OS_MANAGARM
++#elif DETECT_OS_LINUX || DETECT_OS_CYGWIN || DETECT_OS_SOLARIS || DETECT_OS_HURD || DETECT_OS_MANAGARM || DETECT_OS_MINIX
+ #  include <unistd.h>
+ #elif DETECT_OS_OPENBSD || DETECT_OS_FREEBSD
+ #  include <sys/resource.h>
+@@ -266,7 +266,7 @@
+ bool
+ os_get_total_physical_memory(uint64_t *size)
+ {
+-#if DETECT_OS_LINUX || DETECT_OS_CYGWIN || DETECT_OS_SOLARIS || DETECT_OS_HURD || DETECT_OS_MANAGARM
++#if DETECT_OS_LINUX || DETECT_OS_CYGWIN || DETECT_OS_SOLARIS || DETECT_OS_HURD || DETECT_OS_MANAGARM || DETECT_OS_MINIX
+    const long phys_pages = sysconf(_SC_PHYS_PAGES);
+    const long page_size = sysconf(_SC_PAGE_SIZE);
+ 
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/src/util/texcompress_astc_luts.cpp b/src/util/texcompress_astc_luts.cpp
+--- a/src/util/texcompress_astc_luts.cpp	2024-06-06 20:57:27.000000000 +0200
++++ b/src/util/texcompress_astc_luts.cpp	2026-11-08 07:22:22.798905212 +0200
+@@ -23,7 +23,6 @@
+ #include <assert.h>
+ #include <cstdint>
+ #include <cstring>
+-#include <mutex>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -349,16 +348,18 @@
+ 
+ ASTCLutHolder::PartitionTable &ASTCLutHolder::get_partition_table(unsigned width, unsigned height)
+ {
+-	std::lock_guard<std::mutex> holder{table_lock};
++	mtx_lock(&table_lock.m);
+ 	auto itr = tables.find(width * 16 + height);
+ 	if (itr != tables.end())
+ 	{
++		mtx_unlock(&table_lock.m);
+ 		return itr->second;
+ 	}
+ 	else
+ 	{
+ 		auto &t = tables[width * 16 + height];
+ 		t = { width, height };
++		mtx_unlock(&table_lock.m);
+ 		return t;
+ 	}
+ }
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/src/util/texcompress_astc_luts.h b/src/util/texcompress_astc_luts.h
+--- a/src/util/texcompress_astc_luts.h	2024-06-06 20:57:27.000000000 +0200
++++ b/src/util/texcompress_astc_luts.h	2026-11-08 07:22:15.624898919 +0200
+@@ -22,7 +22,7 @@
+ 
+ #pragma once
+ 
+-#include <mutex>
++#include "c11/threads.h"
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -117,7 +117,11 @@
+                 unsigned lut_height = 0;
+         };
+ 
+-        std::mutex table_lock;
++        struct table_lock_t {
++                mtx_t m;
++                table_lock_t() { mtx_init(&m, mtx_plain); }
++                ~table_lock_t() { mtx_destroy(&m); }
++        } table_lock;
+         std::unordered_map<unsigned, PartitionTable> tables;
+ 
+         PartitionTable &get_partition_table(unsigned width, unsigned height);
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/src/util/u_endian.h b/src/util/u_endian.h
+--- a/src/util/u_endian.h	2024-06-06 20:57:27.000000000 +0200
++++ b/src/util/u_endian.h	2026-11-08 07:18:04.429233777 +0200
+@@ -69,7 +69,7 @@
+ # define UTIL_ARCH_BIG_ENDIAN 1
+ #endif
+ 
+-#elif defined(__NetBSD__) || defined(__FreeBSD__) || \
++#elif defined(__NetBSD__) || defined(__FreeBSD__) || defined(__minix) || \
+       defined(__DragonFly__)
+ #include <sys/types.h>
+ #include <machine/endian.h>
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/src/util/u_process.c b/src/util/u_process.c
+--- a/src/util/u_process.c	2024-06-06 20:57:27.000000000 +0200
++++ b/src/util/u_process.c	2026-11-08 07:18:21.863024760 +0200
+@@ -103,7 +103,7 @@
+ {
+    return strdup(program_invocation_short_name);
+ }
+-#elif defined(__FreeBSD__) || defined(__DragonFly__) || defined(__APPLE__) || defined(ANDROID) || defined(__NetBSD__)
++#elif defined(__FreeBSD__) || defined(__DragonFly__) || defined(__APPLE__) || defined(ANDROID) || defined(__NetBSD__) || defined(__minix)
+ #if defined(__NetBSD__)
+ #    include <sys/param.h>
+ #endif
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/src/util/u_thread.c b/src/util/u_thread.c
+--- a/src/util/u_thread.c	2024-06-06 20:57:27.000000000 +0200
++++ b/src/util/u_thread.c	2026-11-08 07:16:57.284538678 +0200
+@@ -154,7 +154,7 @@
+ int64_t
+ util_thread_get_time_nano(thrd_t thread)
+ {
+-#if defined(HAVE_PTHREAD) && !defined(__APPLE__) && !defined(__HAIKU__) && !defined(__managarm__)
++#if defined(HAVE_PTHREAD) && !defined(__APPLE__) && !defined(__HAIKU__) && !defined(__managarm__) && !defined(__minix)
+    struct timespec ts;
+    clockid_t cid;
+ 
+@@ -174,7 +174,7 @@
+ #endif
+ }
+ 
+-#if defined(HAVE_PTHREAD) && !defined(__APPLE__) && !defined(__HAIKU__)
++#if defined(HAVE_PTHREAD) && !defined(__APPLE__) && !defined(__HAIKU__) && !defined(__minix)
+ 
+ void util_barrier_init(util_barrier *barrier, unsigned count)
+ {
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/src/util/u_thread.h b/src/util/u_thread.h
+--- a/src/util/u_thread.h	2024-06-06 20:57:27.000000000 +0200
++++ b/src/util/u_thread.h	2026-11-08 07:16:57.283710715 +0200
+@@ -116,7 +116,7 @@
+  * util_barrier
+  */
+ 
+-#if defined(HAVE_PTHREAD) && !defined(__APPLE__) && !defined(__HAIKU__)
++#if defined(HAVE_PTHREAD) && !defined(__APPLE__) && !defined(__HAIKU__) && !defined(__minix)
+ 
+ typedef pthread_barrier_t util_barrier;
+ 

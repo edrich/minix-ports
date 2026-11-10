@@ -1,0 +1,82 @@
+diff -ruN -x '*.orig' -x '*.rej' a/meson.build b/meson.build
+--- a/meson.build	2024-08-24 17:43:55.000000000 +0200
++++ b/meson.build	2026-10-31 20:46:42.843203374 +0200
+@@ -16,7 +16,9 @@
+ config_h.set_quoted('PACKAGE_VERSION', meson.project_version())
+ 
+ cc_args = []
+-if host_machine.system() not in ['freebsd', 'openbsd']
++# MINIX: NetBSD-derived headers hide the BSD extensions wayland uses
++# (mkostemp, LOCAL_PEEREID, ...) under a strict _POSIX_C_SOURCE.
++if host_machine.system() not in ['freebsd', 'openbsd', 'minix']
+ 	cc_args += ['-D_POSIX_C_SOURCE=200809L']
+ endif
+ add_project_arguments(cc_args, language: 'c')
+diff -ruN -x '*.orig' -x '*.rej' a/src/wayland-os.c b/src/wayland-os.c
+--- a/src/wayland-os.c	2024-08-24 17:43:55.000000000 +0200
++++ b/src/wayland-os.c	2026-10-31 20:46:42.843310954 +0200
+@@ -125,6 +125,23 @@
+ 	*pid = ucred.pid;
+ 	return 0;
+ }
++#elif defined(LOCAL_PEEREID)
++/* NetBSD, MINIX */
++int
++wl_os_socket_peercred(int sockfd, uid_t *uid, gid_t *gid, pid_t *pid)
++{
++	socklen_t len;
++	struct unpcbid unp;
++
++	len = sizeof(unp);
++	if (getsockopt(sockfd, 0 /* SOL_LOCAL */, LOCAL_PEEREID, &unp,
++	    &len) < 0)
++		return -1;
++	*uid = unp.unp_euid;
++	*gid = unp.unp_egid;
++	*pid = unp.unp_pid;
++	return 0;
++}
+ #else
+ #error "Don't know how to read ucred on this platform"
+ #endif
+diff -ruN -x '*.orig' -x '*.rej' a/src/wayland-shm.c b/src/wayland-shm.c
+--- a/src/wayland-shm.c	2024-08-24 17:43:55.000000000 +0200
++++ b/src/wayland-shm.c	2026-10-31 21:04:11.567250091 +0200
+@@ -535,6 +535,7 @@
+ 	shm_pool_unref(pool, true);
+ }
+ 
++#ifdef SA_SIGINFO
+ static void
+ reraise_sigbus(void)
+ {
+@@ -579,6 +580,8 @@
+ 	}
+ }
+ 
++#endif /* SA_SIGINFO */
++
+ static void
+ destroy_sigbus_data(void *data)
+ {
+@@ -590,6 +593,7 @@
+ static void
+ init_sigbus_data_key(void)
+ {
++#ifdef SA_SIGINFO
+ 	struct sigaction new_action = {
+ 		.sa_sigaction = sigbus_handler,
+ 		.sa_flags = SA_SIGINFO | SA_NODEFER
+@@ -598,6 +602,12 @@
+ 	sigemptyset(&new_action.sa_mask);
+ 
+ 	sigaction(SIGBUS, &new_action, &wl_shm_old_sigbus_action);
++#else
++	/* No siginfo (MINIX): no SIGBUS handler.  MINIX never raises SIGBUS
++	 * for file mappings - pages beyond the end of the file read as
++	 * zeroes - so a client shrinking its pool cannot crash us. */
++	(void)wl_shm_old_sigbus_action;
++#endif
+ 
+ 	pthread_key_create(&wl_shm_sigbus_data_key, destroy_sigbus_data);
+ }

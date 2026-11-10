@@ -1,0 +1,5 @@
+os-pc: pkg-config files for libraries that the MINIX base system ships
+without one (expat 2.1.0, zlib 1.2.3), so ports find them with
+dependency()/PKG_CHECK_MODULES.  Installed into /usr/pkg/lib/pkgconfig;
+they describe /usr/include and /usr/lib of the OS (the cross pkg-config
+prefixes the sysroot).

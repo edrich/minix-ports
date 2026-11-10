@@ -1,0 +1,100 @@
+diff -ruN -x '*.orig' -x '*.rej' a/include/linux/input.h b/include/linux/input.h
+--- a/include/linux/input.h	2024-08-19 01:26:22.000000000 +0200
++++ b/include/linux/input.h	2026-11-01 17:32:22.426521263 +0200
+@@ -2,4 +2,6 @@
+ #include "linux/input.h"
+ #elif __FreeBSD__
+ #include "freebsd/input.h"
++#elif defined(__minix)
++#include "minix/input.h"
+ #endif
+diff -ruN -x '*.orig' -x '*.rej' a/include/linux/minix/input.h b/include/linux/minix/input.h
+--- a/include/linux/minix/input.h	1970-01-01 02:00:00.000000000 +0200
++++ b/include/linux/minix/input.h	2026-11-01 17:32:22.426608813 +0200
+@@ -0,0 +1,11 @@
++/*
++ * MINIX: the Linux evdev ABI as provided by the input server
++ * (<minix/evdev.h>).  FreeBSD's variant of the kernel header uses the BSD
++ * ioctl encoding MINIX shares; requests with an immediate int argument
++ * (_IOWINT, e.g. EVIOCGRAB) take a pointer to the int on MINIX.
++ */
++#include <sys/ioccom.h>
++#ifndef _IOWINT
++#define _IOWINT(g, n)	_IOW(g, n, int)
++#endif
++#include "../freebsd/input.h"
+diff -ruN -x '*.orig' -x '*.rej' a/src/quirks.c b/src/quirks.c
+--- a/src/quirks.c	2024-08-19 01:26:22.000000000 +0200
++++ b/src/quirks.c	2026-11-01 17:32:22.426725123 +0200
+@@ -460,6 +460,9 @@
+ 	return init_dmi_linux();
+ #elif defined(__FreeBSD__)
+ 	return init_dmi_freebsd();
++#elif defined(__minix)
++	/* No DMI/SMBIOS access on MINIX: match no DMI-specific quirks. */
++	return safe_strdup("dmi:");
+ #else
+ 	return NULL;
+ #endif
+diff -ruN -x '*.orig' -x '*.rej' a/tools/libinput-debug-events.c b/tools/libinput-debug-events.c
+--- a/tools/libinput-debug-events.c	2024-08-19 01:26:22.000000000 +0200
++++ b/tools/libinput-debug-events.c	2026-11-07 08:32:28.789152608 +0200
+@@ -990,6 +990,14 @@
+ 	stop = 1;
+ }
+ 
++#ifndef SA_SIGINFO
++static void
++sighandler_nosiginfo(int signal)
++{
++	sighandler(signal, NULL, NULL);
++}
++#endif
++
+ static void
+ mainloop(struct libinput *li)
+ {
+@@ -1133,8 +1141,12 @@
+ 	}
+ 
+ 	memset(&act, 0, sizeof(act));
++#ifdef SA_SIGINFO
+ 	act.sa_sigaction = sighandler;
+ 	act.sa_flags = SA_SIGINFO;
++#else
++	act.sa_handler = sighandler_nosiginfo;	/* MINIX: no SA_SIGINFO */
++#endif
+ 
+ 	if (sigaction(SIGINT, &act, NULL) == -1) {
+ 		fprintf(stderr, "Failed to set up signal handling (%s)\n",
+diff -ruN -x '*.orig' -x '*.rej' a/tools/libinput-debug-tablet.c b/tools/libinput-debug-tablet.c
+--- a/tools/libinput-debug-tablet.c	2024-08-19 01:26:22.000000000 +0200
++++ b/tools/libinput-debug-tablet.c	2026-11-07 08:32:28.789535389 +0200
+@@ -470,6 +470,14 @@
+ 	stop = 1;
+ }
+ 
++#ifndef SA_SIGINFO
++static void
++sighandler_nosiginfo(int signal)
++{
++	sighandler(signal, NULL, NULL);
++}
++#endif
++
+ static void
+ mainloop(struct context *ctx)
+ {
+@@ -583,8 +591,12 @@
+ 	}
+ 
+ 	memset(&act, 0, sizeof(act));
++#ifdef SA_SIGINFO
+ 	act.sa_sigaction = sighandler;
+ 	act.sa_flags = SA_SIGINFO;
++#else
++	act.sa_handler = sighandler_nosiginfo;	/* MINIX: no SA_SIGINFO */
++#endif
+ 
+ 	if (sigaction(SIGINT, &act, NULL) == -1) {
+ 		fprintf(stderr, "Failed to set up signal handling (%s)\n",

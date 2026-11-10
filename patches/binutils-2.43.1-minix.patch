@@ -1,0 +1,182 @@
+diff --git a/bfd/config.bfd b/bfd/config.bfd
+index 6553aac1..90861c0f 100644
+--- a/bfd/config.bfd
++++ b/bfd/config.bfd
+@@ -587,6 +587,10 @@ case "${targ}" in
+     targ_selvecs=hppa_elf32_vec
+     ;;
+ 
++  i[3-7]86-*-minix*)
++    targ_defvec=i386_elf32_minix_vec
++    targ_selvecs="iamcu_elf32_vec i386_coff_vec"
++    ;;
+   i[3-7]86-*-elf* | i[3-7]86-*-rtems* | i[3-7]86-*-genode*)
+     targ_defvec=i386_elf32_vec
+     targ_selvecs="iamcu_elf32_vec i386_coff_vec"
+diff --git a/bfd/configure b/bfd/configure
+index 90a60f50..c771433e 100755
+--- a/bfd/configure
++++ b/bfd/configure
+@@ -15891,6 +15891,7 @@ do
+     i386_coff_go32_vec)		 tb="$tb coff-go32.lo $coff" ;;
+     i386_coff_go32stubbed_vec)	 tb="$tb coff-stgo32.lo $coff" ;;
+     i386_coff_lynx_vec)		 tb="$tb cf-i386lynx.lo lynx-core.lo $coff" ;;
++    i386_elf32_minix_vec)		 tb="$tb elf32-i386.lo $elfxx_x86 elf32.lo $elf" ;;
+     i386_elf32_vec)		 tb="$tb elf32-i386.lo $elfxx_x86 elf32.lo $elf" ;;
+     i386_elf32_fbsd_vec)	 tb="$tb elf32-i386.lo $elfxx_x86 elf32.lo $elf" ;;
+     i386_elf32_sol2_vec)	 tb="$tb elf32-i386.lo $elfxx_x86 elf32.lo $elf" ;;
+diff --git a/bfd/configure.ac b/bfd/configure.ac
+index 6bcfd1b7..b8bb48c3 100644
+--- a/bfd/configure.ac
++++ b/bfd/configure.ac
+@@ -477,6 +477,7 @@ do
+     i386_coff_go32_vec)		 tb="$tb coff-go32.lo $coff" ;;
+     i386_coff_go32stubbed_vec)	 tb="$tb coff-stgo32.lo $coff" ;;
+     i386_coff_lynx_vec)		 tb="$tb cf-i386lynx.lo lynx-core.lo $coff" ;;
++    i386_elf32_minix_vec)		 tb="$tb elf32-i386.lo $elfxx_x86 elf32.lo $elf" ;;
+     i386_elf32_vec)		 tb="$tb elf32-i386.lo $elfxx_x86 elf32.lo $elf" ;;
+     i386_elf32_fbsd_vec)	 tb="$tb elf32-i386.lo $elfxx_x86 elf32.lo $elf" ;;
+     i386_elf32_sol2_vec)	 tb="$tb elf32-i386.lo $elfxx_x86 elf32.lo $elf" ;;
+diff --git a/bfd/elf32-i386.c b/bfd/elf32-i386.c
+index 7d573e7e..62ba5dc9 100644
+--- a/bfd/elf32-i386.c
++++ b/bfd/elf32-i386.c
+@@ -4727,3 +4727,15 @@ elf32_iamcu_elf_object_p (bfd *abfd)
+ #define elf32_bed				elf32_i386_vxworks_bed
+ 
+ #include "elf32-target.h"
++
++/* MINIX support.  */
++
++#undef	TARGET_LITTLE_SYM
++#define TARGET_LITTLE_SYM		i386_elf32_minix_vec
++#undef	TARGET_LITTLE_NAME
++#define TARGET_LITTLE_NAME		"elf32-i386-minix"
++
++#undef	elf32_bed
++#define elf32_bed			elf32_i386_minix_bed
++
++#include "elf32-target.h"
+diff --git a/bfd/targets.c b/bfd/targets.c
+index 0d5d73ba..f2b11106 100644
+--- a/bfd/targets.c
++++ b/bfd/targets.c
+@@ -747,6 +747,7 @@ extern const bfd_target i386_coff_vec;
+ extern const bfd_target i386_coff_go32_vec;
+ extern const bfd_target i386_coff_go32stubbed_vec;
+ extern const bfd_target i386_coff_lynx_vec;
++extern const bfd_target i386_elf32_minix_vec;
+ extern const bfd_target i386_elf32_vec;
+ extern const bfd_target i386_elf32_fbsd_vec;
+ extern const bfd_target i386_elf32_sol2_vec;
+@@ -1096,6 +1097,7 @@ static const bfd_target * const _bfd_target_vector[] =
+ 	&i386_coff_go32_vec,
+ 	&i386_coff_go32stubbed_vec,
+ 	&i386_coff_lynx_vec,
++	&i386_elf32_minix_vec,
+ 	&i386_elf32_vec,
+ 	&i386_elf32_fbsd_vec,
+ 	&i386_elf32_sol2_vec,
+diff --git a/gas/config/tc-i386.h b/gas/config/tc-i386.h
+index cda7166b..6afecf72 100644
+--- a/gas/config/tc-i386.h
++++ b/gas/config/tc-i386.h
+@@ -68,6 +68,10 @@ extern unsigned long i386_mach (void);
+ #define ELF_TARGET_FORMAT64	"elf64-x86-64-sol2"
+ #endif
+ 
++#ifdef TE_MINIX
++#define ELF_TARGET_FORMAT	"elf32-i386-minix"
++#endif
++
+ #ifndef ELF_TARGET_FORMAT
+ #define ELF_TARGET_FORMAT	"elf32-i386"
+ #endif
+diff --git a/gas/config/te-minix.h b/gas/config/te-minix.h
+new file mode 100644
+index 00000000..ca4817c7
+--- /dev/null
++++ b/gas/config/te-minix.h
+@@ -0,0 +1,8 @@
++#define TE_MINIX 1
++
++/* We do not know what target is under us exactly; the assembler part of
++   libgcc uses local labels in both styles.  */
++#define LOCAL_LABELS_DOLLAR 1
++#define LOCAL_LABELS_FB 1
++
++#include "obj-format.h"
+diff --git a/gas/configure.tgt b/gas/configure.tgt
+index d58f2187..b402f38f 100644
+--- a/gas/configure.tgt
++++ b/gas/configure.tgt
+@@ -228,6 +228,7 @@ case ${generic_target} in
+   i386-*-beospe*)			fmt=coff em=pe ;;
+   i386-*-beos*)				fmt=elf ;;
+   i386-*-elfiamcu)			fmt=elf arch=iamcu ;;
++  i386-*-minix*)			fmt=elf em=minix ;;
+   i386-*-elf*)				fmt=elf ;;
+   i386-*-fuchsia*)			fmt=elf ;;
+   i386-*-haiku*)			fmt=elf em=haiku ;;
+diff --git a/ld/Makefile.am b/ld/Makefile.am
+index 6a9833e5..581a9a65 100644
+--- a/ld/Makefile.am
++++ b/ld/Makefile.am
+@@ -281,6 +281,7 @@ ALL_EMULATION_SOURCES = \
+ 	eelf_i386_fbsd.c \
+ 	eelf_i386_haiku.c \
+ 	eelf_i386_ldso.c \
++	eelf_i386_minix.c \
+ 	eelf_i386_sol2.c \
+ 	eelf_i386_vxworks.c \
+ 	eelf_iamcu.c \
+diff --git a/ld/Makefile.in b/ld/Makefile.in
+index 8639e782..efad35f4 100644
+--- a/ld/Makefile.in
++++ b/ld/Makefile.in
+@@ -792,6 +792,7 @@ ALL_EMULATION_SOURCES = \
+ 	eelf_i386_fbsd.c \
+ 	eelf_i386_haiku.c \
+ 	eelf_i386_ldso.c \
++	eelf_i386_minix.c \
+ 	eelf_i386_sol2.c \
+ 	eelf_i386_vxworks.c \
+ 	eelf_iamcu.c \
+@@ -1482,6 +1483,7 @@ distclean-compile:
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/eelf_i386_fbsd.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/eelf_i386_haiku.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/eelf_i386_ldso.Po@am__quote@
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/eelf_i386_minix.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/eelf_i386_sol2.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/eelf_i386_vxworks.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/eelf_iamcu.Po@am__quote@
+diff --git a/ld/configure.tgt b/ld/configure.tgt
+index f937f78b..c85fc11c 100644
+--- a/ld/configure.tgt
++++ b/ld/configure.tgt
+@@ -402,6 +402,9 @@ i[3-7]86-*-openbsd*)
+ i[3-7]86-*-elfiamcu)	targ_emul=elf_iamcu
+ 			targ_extra_emuls=elf_i386
+ 			;;
++i[3-7]86-*-minix*)	targ_emul=elf_i386_minix
++			targ_extra_emuls="elf_i386 elf_iamcu"
++			;;
+ i[3-7]86-*-elf* | i[3-7]86-*-rtems* | i[3-7]86-*-genode*)
+ 			targ_emul=elf_i386
+ 			targ_extra_emuls=elf_iamcu
+diff --git a/ld/emulparams/elf_i386_minix.sh b/ld/emulparams/elf_i386_minix.sh
+new file mode 100644
+index 00000000..b5df9dad
+--- /dev/null
++++ b/ld/emulparams/elf_i386_minix.sh
+@@ -0,0 +1,3 @@
++. ${srcdir}/emulparams/elf_i386.sh
++. ${srcdir}/emulparams/elf_minix.sh
++OUTPUT_FORMAT="elf32-i386-minix"
+diff --git a/ld/emulparams/elf_minix.sh b/ld/emulparams/elf_minix.sh
+new file mode 100644
+index 00000000..d909f960
+--- /dev/null
++++ b/ld/emulparams/elf_minix.sh
+@@ -0,0 +1 @@
++ELF_INTERPRETER_NAME=\"/usr/libexec/ld.elf_so\"

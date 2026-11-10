@@ -1,0 +1,1079 @@
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/meson.build b/meson.build
+--- a/meson.build	2024-08-26 22:10:22.000000000 +0200
++++ b/meson.build	2026-10-31 20:38:30.405526087 +0200
+@@ -262,6 +262,10 @@
+   ),
+   config_file, format_mod_static_table
+ ]
++if host_machine.system() == 'minix'
++  # Linux KMS ioctl emulation over the MINIX DRM-lite device.
++  libdrm_files += files('minix_drm.c')
++endif
+ 
+ # Build an unversioned so on android
+ if android
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/minix_drm.c b/minix_drm.c
+--- a/minix_drm.c	1970-01-01 02:00:00.000000000 +0200
++++ b/minix_drm.c	2026-11-10 13:35:39.365809100 +0200
+@@ -0,0 +1,916 @@
++/*
++ * minix_drm.c - Linux DRM/KMS ioctl emulation for MINIX.
++ *
++ * MINIX has no DRM subsystem; its display drivers offer the small "DRM-lite"
++ * interface of <sys/ioc_mdrm.h> on /dev/drm0 (dumb buffers in video memory,
++ * a mode set, page flips with read(2)able completion events in the Linux
++ * drm_event_vblank format).  libdrm routes every drmIoctl() here, and this
++ * file presents the Linux KMS object model on top of it:
++ *
++ *   one CRTC, one encoder, one connector ("Virtual-1", always connected,
++ *   the driver's mode list) and one primary plane (XRGB8888/ARGB8888),
++ *   framebuffers (ADDFB/ADDFB2 of dumb buffers) kept per fd, the plane
++ *   "type" property, the connector "DPMS" property (settable; recorded
++ *   only), legacy SETCRTC + PAGE_FLIP (no atomic), WAIT_VBLANK
++ *   queries, VERSION/GET_CAP/SET_CLIENT_CAP, and PRIME (driver interface
++ *   version 2): a dma-buf fd is another open of /dev/drm0 bound to the
++ *   buffer (MDRM_PRIME_EXPORT + MDRM_PRIME_BIND), imported with
++ *   MDRM_PRIME_INFO + MDRM_PRIME_IMPORT.  lseek() cannot size such an fd
++ *   (character devices have no size): MDRM_PRIME_INFO can.
++ *
++ * Unsupported (yet): atomic modesetting, cursors, gamma, property blobs.  Those fail with the errno Linux uses for
++ * a driver lacking the feature, so clients take their fallback paths.
++ */
++
++#include <sys/types.h>
++#include <sys/ioctl.h>
++#include <sys/stat.h>
++#include <sys/ioc_mdrm.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++
++#include "drm.h"
++#include "drm_mode.h"
++#include "drm_fourcc.h"
++#include "libdrm_macros.h"
++#include "xf86drm.h"
++#include "minix_drm.h"
++
++#define MDRM_MAJOR	18
++#define MDRM_DEVICE	"/dev/drm0"
++
++/* Values of the userspace-only enums (xf86drmMode.h / kernel drm_plane.h). */
++#define CONN_CONNECTED		1	/* DRM_MODE_CONNECTED */
++#define SUBPIXEL_UNKNOWN	1	/* DRM_MODE_SUBPIXEL_UNKNOWN */
++#define PLANE_TYPE_PRIMARY	1	/* DRM_PLANE_TYPE_PRIMARY */
++
++/* KMS object ids (one id space, as in Linux). */
++#define ID_CRTC		0x20
++#define ID_ENCODER	0x21
++#define ID_CONNECTOR	0x22
++#define ID_PLANE	0x23
++#define ID_PROP_TYPE	0x30
++#define ID_PROP_DPMS	0x31
++#define ID_FB_BASE	0x100
++
++#define MAX_FDS		16
++#define MAX_FBS		64
++
++#define VPTR(x)		((void *)(uintptr_t)(x))
++
++struct mfb {
++	uint32_t	id;		/* 0: free */
++	uint32_t	handle;		/* the framebuffer's own handle (see fb_add) */
++	uint32_t	user_handle;	/* the handle ADDFB was given */
++	uint32_t	width, height, pitch, format;
++};
++
++struct mfd {
++	int		fd;		/* -1: free */
++	dev_t		rdev;		/* the cloned minor identifies the open */
++	int		universal_planes;
++	uint32_t	scanout_fb;	/* fb id this fd last put on screen */
++	uint32_t	next_fb;
++	struct mfb	fbs[MAX_FBS];
++};
++
++static struct mfd fds[MAX_FDS];
++static uint64_t dpms_state;		/* DRM_MODE_DPMS_*: recorded only */
++static int fds_init;
++
++static struct mfd *
++lookup_fd(int fd)
++{
++	struct stat st;
++	struct mfd *free_slot = NULL, *m;
++	int i;
++
++	if (fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode) ||
++	    major(st.st_rdev) != MDRM_MAJOR)
++		return NULL;
++
++	if (!fds_init) {
++		for (i = 0; i < MAX_FDS; i++)
++			fds[i].fd = -1;
++		fds_init = 1;
++	}
++	for (i = 0; i < MAX_FDS; i++) {
++		m = &fds[i];
++		if (m->fd == fd) {
++			if (m->rdev == st.st_rdev)
++				return m;
++			free_slot = m;	/* fd number reused: stale state */
++			break;
++		}
++		if (m->fd == -1 && free_slot == NULL)
++			free_slot = m;
++	}
++	if (free_slot == NULL)
++		free_slot = &fds[0];	/* evict; should not happen */
++	memset(free_slot, 0, sizeof(*free_slot));
++	free_slot->fd = fd;
++	free_slot->rdev = st.st_rdev;
++	free_slot->next_fb = ID_FB_BASE;
++	return free_slot;
++}
++
++static int
++fail(int err)
++{
++	errno = err;
++	return -1;
++}
++
++/* Copy a string into a (ptr, len) pair, two-pass style. */
++static void
++put_string(const char *s, __kernel_size_t *lenp, char *buf)
++{
++	size_t len = strlen(s);
++
++	if (buf != NULL && *lenp > 0)
++		memcpy(buf, s, len < *lenp ? len : *lenp);
++	*lenp = len;
++}
++
++static void
++put_ids(uint64_t ptr, uint32_t room, const uint32_t *ids, uint32_t n)
++{
++	uint32_t i, *out = VPTR(ptr);
++
++	if (out == NULL)
++		return;
++	for (i = 0; i < n && i < room; i++)
++		out[i] = ids[i];
++}
++
++static void
++make_mode(struct drm_mode_modeinfo *m, unsigned w, unsigned h, unsigned hz,
++	int preferred)
++{
++	memset(m, 0, sizeof(*m));
++	/* Plausible CVT-reduced-blanking-like timings; nothing is driven by
++	 * them, but clients compute the refresh rate from clock and totals. */
++	m->hdisplay = w;
++	m->hsync_start = w + 48;
++	m->hsync_end = w + 80;
++	m->htotal = w + 160;
++	m->vdisplay = h;
++	m->vsync_start = h + 3;
++	m->vsync_end = h + 9;
++	m->vtotal = h + 30;
++	m->vrefresh = hz ? hz : 60;
++	m->clock = (uint32_t)((uint64_t)m->htotal * m->vtotal *
++	    m->vrefresh / 1000);
++	m->flags = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC;
++	m->type = DRM_MODE_TYPE_DRIVER |
++	    (preferred ? DRM_MODE_TYPE_PREFERRED : 0);
++	snprintf(m->name, sizeof(m->name), "%ux%u", w, h);
++}
++
++static int
++getinfo(int fd, struct mdrm_info *info)
++{
++	return ioctl(fd, MDRM_GETINFO, info);
++}
++
++static struct mfb *
++fb_lookup(struct mfd *m, uint32_t id)
++{
++	int i;
++
++	for (i = 0; i < MAX_FBS; i++)
++		if (m->fbs[i].id != 0 && m->fbs[i].id == id)
++			return &m->fbs[i];
++	return NULL;
++}
++
++static uint32_t
++fb_id_of_handle(struct mfd *m, uint32_t handle)
++{
++	int i;
++
++	if (handle == 0)
++		return 0;
++	if (m->scanout_fb != 0 && fb_lookup(m, m->scanout_fb) != NULL)
++		return m->scanout_fb;
++	for (i = 0; i < MAX_FBS; i++)
++		if (m->fbs[i].id != 0 && (m->fbs[i].handle == handle ||
++		    m->fbs[i].user_handle == handle))
++			return m->fbs[i].id;
++	return 0;
++}
++
++/* A second handle for one of m's buffers (the original if the driver is
++ * too old to duplicate). */
++static uint32_t
++dup_handle(struct mfd *m, uint32_t handle)
++{
++	struct mdrm_prime pr;
++
++	memset(&pr, 0, sizeof(pr));
++	pr.handle = handle;
++	if (ioctl(m->fd, MDRM_DUP_HANDLE, &pr) != 0)
++		return handle;
++	return pr.handle;
++}
++
++static void
++fb_release(struct mfd *m, struct mfb *fb)
++{
++	struct mdrm_destroy_dumb d;
++
++	if (fb->handle != fb->user_handle) {
++		d.handle = fb->handle;
++		(void)ioctl(m->fd, MDRM_DESTROY_DUMB, &d);
++	}
++	if (m->scanout_fb == fb->id)
++		m->scanout_fb = 0;
++	memset(fb, 0, sizeof(*fb));
++}
++
++static int
++fb_add(struct mfd *m, uint32_t handle, uint32_t w, uint32_t h,
++	uint32_t pitch, uint32_t format, uint32_t *idp)
++{
++	struct mdrm_map_dumb map;
++	int i;
++
++	if (format != DRM_FORMAT_XRGB8888 && format != DRM_FORMAT_ARGB8888)
++		return fail(EINVAL);
++	if (w == 0 || h == 0 || pitch != w * 4)
++		return fail(EINVAL);
++	/* The handle must be one of this client's dumb buffers. */
++	memset(&map, 0, sizeof(map));
++	map.handle = handle;
++	if (ioctl(m->fd, MDRM_MAP_DUMB, &map) != 0)
++		return fail(ENOENT);
++
++	for (i = 0; i < MAX_FBS; i++) {
++		if (m->fbs[i].id == 0) {
++			m->fbs[i].id = m->next_fb++;
++			/* A Linux framebuffer keeps its buffer: it stays valid
++			 * after GEM_CLOSE of the handle (wlroots closes it right
++			 * away).  Hold a private handle of our own. */
++			m->fbs[i].user_handle = handle;
++			m->fbs[i].handle = dup_handle(m, handle);
++			m->fbs[i].width = w;
++			m->fbs[i].height = h;
++			m->fbs[i].pitch = pitch;
++			m->fbs[i].format = format;
++			*idp = m->fbs[i].id;
++			return 0;
++		}
++	}
++	return fail(ENOSPC);
++}
++
++static int
++do_version(struct drm_version *v)
++{
++	v->version_major = 1;
++	v->version_minor = 0;
++	v->version_patchlevel = 0;
++	put_string("bochs", &v->name_len, v->name);
++	put_string("20261031", &v->date_len, v->date);
++	put_string("MINIX DRM-lite (bochs)", &v->desc_len, v->desc);
++	return 0;
++}
++
++/* Does the driver behind fd speak PRIME (interface version 2)? */
++static int
++has_prime(int fd)
++{
++	struct mdrm_info info;
++
++	return getinfo(fd, &info) == 0 && info.version >= 2;
++}
++
++static int
++do_get_cap(int fd, struct drm_get_cap *c)
++{
++	switch (c->capability) {
++	case DRM_CAP_DUMB_BUFFER:		c->value = 1; break;
++	case DRM_CAP_DUMB_PREFERRED_DEPTH:	c->value = 24; break;
++	case DRM_CAP_DUMB_PREFER_SHADOW:	c->value = 0; break;
++	case DRM_CAP_TIMESTAMP_MONOTONIC:	c->value = 1; break;
++	case DRM_CAP_CRTC_IN_VBLANK_EVENT:	c->value = 1; break;
++	case DRM_CAP_VBLANK_HIGH_CRTC:		c->value = 0; break;
++	case DRM_CAP_PRIME:
++		c->value = has_prime(fd) ?
++		    DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT : 0;
++		break;
++	case DRM_CAP_ASYNC_PAGE_FLIP:		c->value = 0; break;
++	case DRM_CAP_ADDFB2_MODIFIERS:		c->value = 0; break;
++	case DRM_CAP_PAGE_FLIP_TARGET:		c->value = 0; break;
++	case DRM_CAP_SYNCOBJ:			c->value = 0; break;
++	case DRM_CAP_SYNCOBJ_TIMELINE:		c->value = 0; break;
++	case DRM_CAP_CURSOR_WIDTH:
++	case DRM_CAP_CURSOR_HEIGHT:		c->value = 64; break;
++	default:
++		return fail(EINVAL);
++	}
++	return 0;
++}
++
++static int
++do_set_client_cap(struct mfd *m, struct drm_set_client_cap *c)
++{
++	switch (c->capability) {
++	case DRM_CLIENT_CAP_UNIVERSAL_PLANES:
++		if (c->value > 1) return fail(EINVAL);
++		m->universal_planes = (int)c->value;
++		return 0;
++	case DRM_CLIENT_CAP_STEREO_3D:
++	case DRM_CLIENT_CAP_ASPECT_RATIO:
++		return c->value > 1 ? fail(EINVAL) : 0;
++	case DRM_CLIENT_CAP_ATOMIC:
++		return fail(EOPNOTSUPP);	/* as a driver without atomic */
++	default:
++		return fail(EINVAL);
++	}
++}
++
++static int
++do_getresources(struct mfd *m, struct drm_mode_card_res *r)
++{
++	struct mdrm_info info;
++	uint32_t ids[MAX_FBS], n = 0, one;
++	int i;
++
++	if (getinfo(m->fd, &info) != 0)
++		return -1;
++
++	for (i = 0; i < MAX_FBS; i++)
++		if (m->fbs[i].id != 0)
++			ids[n++] = m->fbs[i].id;
++	put_ids(r->fb_id_ptr, r->count_fbs, ids, n);
++	r->count_fbs = n;
++	one = ID_CRTC;
++	put_ids(r->crtc_id_ptr, r->count_crtcs, &one, 1);
++	r->count_crtcs = 1;
++	one = ID_CONNECTOR;
++	put_ids(r->connector_id_ptr, r->count_connectors, &one, 1);
++	r->count_connectors = 1;
++	one = ID_ENCODER;
++	put_ids(r->encoder_id_ptr, r->count_encoders, &one, 1);
++	r->count_encoders = 1;
++	r->min_width = 8;
++	r->min_height = 8;
++	r->max_width = info.max_width < 8192 ? info.max_width : 8192;
++	r->max_height = info.max_height < 8192 ? info.max_height : 8192;
++	return 0;
++}
++
++static int
++do_getconnector(struct mfd *m, struct drm_mode_get_connector *c)
++{
++	struct mdrm_info info;
++	struct drm_mode_modeinfo *modes = VPTR(c->modes_ptr);
++	uint32_t enc = ID_ENCODER, i, w = 1024, h = 768;
++
++	if (c->connector_id != ID_CONNECTOR)
++		return fail(ENOENT);
++	if (getinfo(m->fd, &info) != 0)
++		return -1;
++
++	if (modes != NULL)
++		for (i = 0; i < info.nmodes && i < c->count_modes; i++)
++			make_mode(&modes[i], info.modes[i].width,
++			    info.modes[i].height, info.modes[i].refresh,
++			    info.modes[i].flags & MDRM_MODE_PREFERRED);
++	c->count_modes = info.nmodes;
++	if (c->count_props >= 1) {
++		uint32_t *props = VPTR(c->props_ptr);
++		uint64_t *values = VPTR(c->prop_values_ptr);
++		if (props != NULL) props[0] = ID_PROP_DPMS;
++		if (values != NULL) values[0] = dpms_state;
++	}
++	c->count_props = 1;
++	put_ids(c->encoders_ptr, c->count_encoders, &enc, 1);
++	c->count_encoders = 1;
++	c->encoder_id = info.cur_width != 0 ? ID_ENCODER : 0;
++	c->connector_type = DRM_MODE_CONNECTOR_VIRTUAL;
++	c->connector_type_id = 1;
++	c->connection = CONN_CONNECTED;
++	for (i = 0; i < info.nmodes; i++)
++		if (info.modes[i].flags & MDRM_MODE_PREFERRED) {
++			w = info.modes[i].width;
++			h = info.modes[i].height;
++		}
++	/* Physical size for 96 DPI. */
++	c->mm_width = w * 254 / 960;
++	c->mm_height = h * 254 / 960;
++	c->subpixel = SUBPIXEL_UNKNOWN;
++	return 0;
++}
++
++static int
++do_getencoder(struct mfd *m, struct drm_mode_get_encoder *e)
++{
++	struct mdrm_info info;
++
++	if (e->encoder_id != ID_ENCODER)
++		return fail(ENOENT);
++	if (getinfo(m->fd, &info) != 0)
++		return -1;
++	e->encoder_type = DRM_MODE_ENCODER_VIRTUAL;
++	e->crtc_id = info.cur_width != 0 ? ID_CRTC : 0;
++	e->possible_crtcs = 1;
++	e->possible_clones = 0;
++	return 0;
++}
++
++static int
++do_getcrtc(struct mfd *m, struct drm_mode_crtc *c)
++{
++	struct mdrm_info info;
++
++	if (c->crtc_id != ID_CRTC)
++		return fail(ENOENT);
++	if (getinfo(m->fd, &info) != 0)
++		return -1;
++	c->x = c->y = 0;
++	c->gamma_size = 0;
++	c->fb_id = fb_id_of_handle(m, info.cur_fb);
++	if (info.cur_width != 0) {
++		c->mode_valid = 1;
++		make_mode(&c->mode, info.cur_width, info.cur_height, 60, 0);
++	} else {
++		c->mode_valid = 0;
++		memset(&c->mode, 0, sizeof(c->mode));
++	}
++	return 0;
++}
++
++static int
++do_setcrtc(struct mfd *m, struct drm_mode_crtc *c)
++{
++	struct mdrm_info info;
++	struct mdrm_setcrtc sc;
++	struct mfb *fb;
++	uint32_t *conns = VPTR(c->set_connectors_ptr);
++	uint32_t fb_id = c->fb_id;
++
++	if (c->crtc_id != ID_CRTC)
++		return fail(ENOENT);
++	memset(&sc, 0, sizeof(sc));
++
++	if (!c->mode_valid || c->count_connectors == 0 || fb_id == 0) {
++		/* Disable the CRTC. */
++		if (ioctl(m->fd, MDRM_SETCRTC, &sc) != 0)
++			return -1;
++		m->scanout_fb = 0;
++		return 0;
++	}
++	if (c->count_connectors != 1 || conns == NULL ||
++	    conns[0] != ID_CONNECTOR)
++		return fail(EINVAL);
++	if (c->x != 0 || c->y != 0)
++		return fail(EINVAL);	/* no panning */
++
++	if (fb_id == (uint32_t)-1) {
++		/* Keep the current framebuffer. */
++		if (getinfo(m->fd, &info) != 0)
++			return -1;
++		fb_id = fb_id_of_handle(m, info.cur_fb);
++	}
++	if ((fb = fb_lookup(m, fb_id)) == NULL)
++		return fail(ENOENT);
++	if (fb->width < c->mode.hdisplay || fb->height < c->mode.vdisplay)
++		return fail(ENOSPC);
++
++	sc.fb = fb->handle;
++	sc.width = c->mode.hdisplay;
++	sc.height = c->mode.vdisplay;
++	if (ioctl(m->fd, MDRM_SETCRTC, &sc) != 0)
++		return -1;
++	m->scanout_fb = fb->id;
++	return 0;
++}
++
++static int
++do_page_flip(struct mfd *m, struct drm_mode_crtc_page_flip *f)
++{
++	struct mdrm_page_flip pf;
++	struct mfb *fb;
++
++	if (f->crtc_id != ID_CRTC)
++		return fail(ENOENT);
++	if (f->flags & ~(uint32_t)DRM_MODE_PAGE_FLIP_EVENT)
++		return fail(EINVAL);	/* no async / target flips */
++	if ((fb = fb_lookup(m, f->fb_id)) == NULL)
++		return fail(ENOENT);
++
++	memset(&pf, 0, sizeof(pf));
++	pf.fb = fb->handle;
++	pf.flags = (f->flags & DRM_MODE_PAGE_FLIP_EVENT) ? MDRM_FLIP_EVENT : 0;
++	pf.user_data = f->user_data;
++	pf.crtc_id = ID_CRTC;
++	if (ioctl(m->fd, MDRM_PAGE_FLIP, &pf) != 0)
++		return -1;
++	m->scanout_fb = fb->id;
++	return 0;
++}
++
++static int
++do_getplaneresources(struct mfd *m, struct drm_mode_get_plane_res *r)
++{
++	uint32_t plane = ID_PLANE;
++
++	if (!m->universal_planes) {
++		r->count_planes = 0;	/* primary planes are hidden */
++		return 0;
++	}
++	put_ids(r->plane_id_ptr, r->count_planes, &plane, 1);
++	r->count_planes = 1;
++	return 0;
++}
++
++static int
++do_getplane(struct mfd *m, struct drm_mode_get_plane *p)
++{
++	static const uint32_t formats[] = {
++		DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888
++	};
++	struct mdrm_info info;
++
++	if (p->plane_id != ID_PLANE)
++		return fail(ENOENT);
++	if (getinfo(m->fd, &info) != 0)
++		return -1;
++	p->crtc_id = info.cur_width != 0 ? ID_CRTC : 0;
++	p->fb_id = fb_id_of_handle(m, info.cur_fb);
++	p->possible_crtcs = 1;
++	p->gamma_size = 0;
++	put_ids(p->format_type_ptr, p->count_format_types, formats, 2);
++	p->count_format_types = 2;
++	return 0;
++}
++
++static int
++do_obj_getproperties(struct mfd *m, struct drm_mode_obj_get_properties *g)
++{
++	uint32_t *props = VPTR(g->props_ptr);
++	uint64_t *values = VPTR(g->prop_values_ptr);
++
++	(void)m;
++	switch (g->obj_id) {
++	case ID_PLANE:
++		if (g->obj_type != DRM_MODE_OBJECT_PLANE &&
++		    g->obj_type != DRM_MODE_OBJECT_ANY)
++			return fail(ENOENT);
++		if (g->count_props >= 1 && props != NULL && values != NULL) {
++			props[0] = ID_PROP_TYPE;
++			values[0] = PLANE_TYPE_PRIMARY;
++		}
++		g->count_props = 1;
++		return 0;
++	case ID_CONNECTOR:
++		if (g->obj_type != DRM_MODE_OBJECT_CONNECTOR &&
++		    g->obj_type != DRM_MODE_OBJECT_ANY)
++			return fail(ENOENT);
++		if (g->count_props >= 1 && props != NULL && values != NULL) {
++			props[0] = ID_PROP_DPMS;
++			values[0] = dpms_state;
++		}
++		g->count_props = 1;
++		return 0;
++	case ID_CRTC:
++	case ID_ENCODER:
++		g->count_props = 0;
++		return 0;
++	default:
++		return fail(ENOENT);
++	}
++}
++
++static int
++do_getproperty(struct drm_mode_get_property *p)
++{
++	static const char *type_names[] = { "Overlay", "Primary", "Cursor" };
++	static const char *dpms_names[] = { "On", "Standby", "Suspend", "Off" };
++	uint64_t *values = VPTR(p->values_ptr);
++	struct drm_mode_property_enum *enums = VPTR(p->enum_blob_ptr);
++	const char **names;
++	uint32_t i, n;
++
++	memset(p->name, 0, sizeof(p->name));
++	switch (p->prop_id) {
++	case ID_PROP_TYPE:
++		p->flags = DRM_MODE_PROP_ENUM | DRM_MODE_PROP_IMMUTABLE;
++		strncpy(p->name, "type", sizeof(p->name) - 1);
++		names = type_names;
++		n = 3;
++		break;
++	case ID_PROP_DPMS:
++		p->flags = DRM_MODE_PROP_ENUM;
++		strncpy(p->name, "DPMS", sizeof(p->name) - 1);
++		names = dpms_names;
++		n = 4;
++		break;
++	default:
++		return fail(ENOENT);
++	}
++	for (i = 0; i < n; i++) {
++		if (values != NULL && i < p->count_values)
++			values[i] = i;
++		if (enums != NULL && i < p->count_enum_blobs) {
++			enums[i].value = i;
++			memset(enums[i].name, 0, sizeof(enums[i].name));
++			strncpy(enums[i].name, names[i],
++			    sizeof(enums[i].name) - 1);
++		}
++	}
++	p->count_values = n;
++	p->count_enum_blobs = n;
++	return 0;
++}
++
++/* SETPROPERTY / OBJ_SETPROPERTY: only the connector's DPMS is settable.
++ * Display power follows the mode (SETCRTC), so the value is only kept. */
++static int
++set_property(uint32_t obj_id, uint32_t obj_type, uint32_t prop_id,
++	uint64_t value)
++{
++	if (obj_id != ID_CONNECTOR || (obj_type != DRM_MODE_OBJECT_CONNECTOR &&
++	    obj_type != DRM_MODE_OBJECT_ANY))
++		return fail(ENOENT);
++	if (prop_id != ID_PROP_DPMS)
++		return fail(EINVAL);
++	if (value > DRM_MODE_DPMS_OFF)
++		return fail(EINVAL);
++	dpms_state = value;
++	return 0;
++}
++
++static int
++do_rmfb(struct mfd *m, uint32_t id, int disable)
++{
++	struct mdrm_info info;
++	struct mdrm_setcrtc sc;
++	struct mfb *fb;
++
++	if ((fb = fb_lookup(m, id)) == NULL)
++		return fail(ENOENT);
++	/* Linux RMFB turns off a CRTC still scanning the framebuffer out. */
++	if (disable && getinfo(m->fd, &info) == 0 && info.is_master &&
++	    m->scanout_fb == fb->id) {
++		memset(&sc, 0, sizeof(sc));
++		(void)ioctl(m->fd, MDRM_SETCRTC, &sc);
++	}
++	fb_release(m, fb);
++	return 0;
++}
++
++static int
++do_wait_vblank(int fd, union drm_wait_vblank *vbl)
++{
++	struct mdrm_info info;
++	struct timespec ts;
++	unsigned int type = vbl->request.type;
++	unsigned int n;
++
++	if (type & (_DRM_VBLANK_EVENT | _DRM_VBLANK_SIGNAL))
++		return fail(EINVAL);
++	if (getinfo(fd, &info) != 0)
++		return -1;
++	if (info.cur_width == 0)
++		return fail(EINVAL);	/* CRTC off */
++
++	if (type & _DRM_VBLANK_RELATIVE)
++		n = vbl->request.sequence;
++	else
++		n = vbl->request.sequence > info.vblank_seq ?
++		    vbl->request.sequence - info.vblank_seq : 0;
++	if (n > 0)
++		usleep(n * 16667);	/* emulated 60 Hz */
++
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	vbl->reply.type = type & ~_DRM_VBLANK_RELATIVE;
++	vbl->reply.sequence = info.vblank_seq + n;
++	vbl->reply.tval_sec = ts.tv_sec;
++	vbl->reply.tval_usec = ts.tv_nsec / 1000;
++	return 0;
++}
++
++/* Export: a new open of the device, bound to the buffer, is the dma-buf. */
++static int
++do_prime_handle_to_fd(int fd, struct drm_prime_handle *a)
++{
++	struct mdrm_prime pr;
++	int dfd, err;
++
++	if (a->flags & ~(uint32_t)(DRM_CLOEXEC | DRM_RDWR))
++		return fail(EINVAL);
++	memset(&pr, 0, sizeof(pr));
++	pr.handle = a->handle;
++	if (ioctl(fd, MDRM_PRIME_EXPORT, &pr) != 0)
++		return errno == ENOTTY ? fail(EOPNOTSUPP) : -1;
++	if ((dfd = open(MDRM_DEVICE, O_RDWR |
++	    ((a->flags & DRM_CLOEXEC) ? O_CLOEXEC : 0))) < 0)
++		return -1;
++	if (ioctl(dfd, MDRM_PRIME_BIND, &pr) != 0) {
++		err = errno;
++		close(dfd);
++		return fail(err);
++	}
++	a->fd = dfd;
++	return 0;
++}
++
++static int
++do_prime_fd_to_handle(int fd, struct drm_prime_handle *a)
++{
++	struct mdrm_prime pr;
++
++	memset(&pr, 0, sizeof(pr));
++	if (ioctl(a->fd, MDRM_PRIME_INFO, &pr) != 0)
++		return errno == EBADF ? -1 : fail(EINVAL);	/* not a dma-buf */
++	if (ioctl(fd, MDRM_PRIME_IMPORT, &pr) != 0)
++		return errno == ENOTTY ? fail(EOPNOTSUPP) : -1;
++	a->handle = pr.handle;
++	return 0;
++}
++
++/* Size of a dma-buf fd (MINIX: lseek(SEEK_END) gives 0 on devices). */
++drm_public int
++drmMinixDmabufSize(int dmabuf_fd, uint64_t *size)
++{
++	struct mdrm_prime pr;
++
++	memset(&pr, 0, sizeof(pr));
++	if (ioctl(dmabuf_fd, MDRM_PRIME_INFO, &pr) != 0)
++		return -1;
++	*size = pr.size;
++	return 0;
++}
++
++int
++drm_minix_ioctl(int fd, unsigned long request, void *arg)
++{
++	struct mfd *m;
++
++	if ((m = lookup_fd(fd)) == NULL)
++		return ioctl(fd, request, arg);
++
++	switch (request) {
++	case DRM_IOCTL_VERSION:
++		return do_version(arg);
++	case DRM_IOCTL_GET_UNIQUE: {
++		struct drm_unique *u = arg;
++		put_string("minix:drm0", &u->unique_len, u->unique);
++		return 0;
++	}
++	case DRM_IOCTL_GET_CAP:
++		return do_get_cap(fd, arg);
++	case DRM_IOCTL_SET_CLIENT_CAP:
++		return do_set_client_cap(m, arg);
++	case DRM_IOCTL_SET_MASTER:
++	case DRM_IOCTL_DROP_MASTER:
++		return 0;	/* the driver makes the modesetter master */
++	case DRM_IOCTL_GET_MAGIC: {
++		/* No authentication in DRM-lite: any token works, but it is
++		 * non-zero as on Linux. */
++		struct drm_auth *au = arg;
++		au->magic = 0x4d4e5800u | (minor(m->rdev) & 0xff);
++		return 0;
++	}
++	case DRM_IOCTL_AUTH_MAGIC: {
++		struct drm_auth *au = arg;
++		/* drmIsMaster() probes with magic 0: anything but EACCES
++		 * means master (every client may modeset here). */
++		return au->magic == 0 ? fail(EINVAL) : 0;
++	}
++	case DRM_IOCTL_MODE_SETPROPERTY: {
++		struct drm_mode_connector_set_property *sp = arg;
++		return set_property(sp->connector_id,
++		    DRM_MODE_OBJECT_CONNECTOR, sp->prop_id, sp->value);
++	}
++	case DRM_IOCTL_MODE_OBJ_SETPROPERTY: {
++		struct drm_mode_obj_set_property *sp = arg;
++		return set_property(sp->obj_id, sp->obj_type, sp->prop_id,
++		    sp->value);
++	}
++	case DRM_IOCTL_MODE_CREATE_LEASE:
++		return fail(EOPNOTSUPP);	/* wlroots: plain re-open */
++
++	case DRM_IOCTL_MODE_GETRESOURCES:
++		return do_getresources(m, arg);
++	case DRM_IOCTL_MODE_GETCONNECTOR:
++		return do_getconnector(m, arg);
++	case DRM_IOCTL_MODE_GETENCODER:
++		return do_getencoder(m, arg);
++	case DRM_IOCTL_MODE_GETCRTC:
++		return do_getcrtc(m, arg);
++	case DRM_IOCTL_MODE_SETCRTC:
++		return do_setcrtc(m, arg);
++	case DRM_IOCTL_MODE_PAGE_FLIP:
++		return do_page_flip(m, arg);
++	case DRM_IOCTL_MODE_GETPLANERESOURCES:
++		return do_getplaneresources(m, arg);
++	case DRM_IOCTL_MODE_GETPLANE:
++		return do_getplane(m, arg);
++	case DRM_IOCTL_MODE_OBJ_GETPROPERTIES:
++		return do_obj_getproperties(m, arg);
++	case DRM_IOCTL_MODE_GETPROPERTY:
++		return do_getproperty(arg);
++
++	case DRM_IOCTL_MODE_CREATE_DUMB:
++		return ioctl(fd, MDRM_CREATE_DUMB, arg);	/* same layout */
++	case DRM_IOCTL_MODE_MAP_DUMB:
++		return ioctl(fd, MDRM_MAP_DUMB, arg);
++	case DRM_IOCTL_MODE_DESTROY_DUMB:
++		return ioctl(fd, MDRM_DESTROY_DUMB, arg);
++	case DRM_IOCTL_GEM_CLOSE: {
++		struct drm_gem_close *gc = arg;
++		struct mdrm_destroy_dumb d;
++		d.handle = gc->handle;
++		return ioctl(fd, MDRM_DESTROY_DUMB, &d);
++	}
++
++	case DRM_IOCTL_MODE_ADDFB: {
++		struct drm_mode_fb_cmd *f = arg;
++		uint32_t fmt;
++		if (f->bpp != 32 || (f->depth != 24 && f->depth != 32))
++			return fail(EINVAL);
++		fmt = f->depth == 32 ? DRM_FORMAT_ARGB8888 :
++		    DRM_FORMAT_XRGB8888;
++		return fb_add(m, f->handle, f->width, f->height, f->pitch,
++		    fmt, &f->fb_id);
++	}
++	case DRM_IOCTL_MODE_ADDFB2: {
++		struct drm_mode_fb_cmd2 *f = arg;
++		int i;
++		if (f->flags & ~(uint32_t)DRM_MODE_FB_MODIFIERS)
++			return fail(EINVAL);
++		if ((f->flags & DRM_MODE_FB_MODIFIERS) &&
++		    f->modifier[0] != DRM_FORMAT_MOD_LINEAR)
++			return fail(EINVAL);
++		if (f->offsets[0] != 0)
++			return fail(EINVAL);
++		for (i = 1; i < 4; i++)
++			if (f->handles[i] != 0)
++				return fail(EINVAL);	/* single plane */
++		return fb_add(m, f->handles[0], f->width, f->height,
++		    f->pitches[0], f->pixel_format, &f->fb_id);
++	}
++	case DRM_IOCTL_MODE_GETFB: {
++		struct drm_mode_fb_cmd *f = arg;
++		struct mfb *fb = fb_lookup(m, f->fb_id);
++		if (fb == NULL) return fail(ENOENT);
++		f->width = fb->width;
++		f->height = fb->height;
++		f->pitch = fb->pitch;
++		f->bpp = 32;
++		f->depth = fb->format == DRM_FORMAT_ARGB8888 ? 32 : 24;
++		f->handle = dup_handle(m, fb->handle);	/* caller closes it */
++		return 0;
++	}
++	case DRM_IOCTL_MODE_GETFB2: {
++		struct drm_mode_fb_cmd2 *f = arg;
++		struct mfb *fb = fb_lookup(m, f->fb_id);
++		if (fb == NULL) return fail(ENOENT);
++		memset(&f->width, 0, sizeof(*f) - sizeof(f->fb_id));
++		f->width = fb->width;
++		f->height = fb->height;
++		f->pixel_format = fb->format;
++		f->handles[0] = dup_handle(m, fb->handle);
++		f->pitches[0] = fb->pitch;
++		return 0;
++	}
++	case DRM_IOCTL_MODE_RMFB:
++		return do_rmfb(m, *(uint32_t *)arg, 1);
++#ifdef DRM_IOCTL_MODE_CLOSEFB
++	case DRM_IOCTL_MODE_CLOSEFB:
++		return do_rmfb(m, ((struct drm_mode_closefb *)arg)->fb_id, 0);
++#endif
++
++	case DRM_IOCTL_WAIT_VBLANK:
++		return do_wait_vblank(fd, arg);
++
++	case DRM_IOCTL_MODE_CURSOR:
++	case DRM_IOCTL_MODE_CURSOR2: {
++		/* No hardware cursor: hiding it (BO with handle 0) and moving it
++		 * succeed - wlroots hides the cursor on every legacy commit of
++		 * an output without a cursor plane, and fails the commit if
++		 * that fails - but a cursor image cannot be shown. */
++		struct drm_mode_cursor *cu = arg;	/* CURSOR2 starts alike */
++		if (cu->crtc_id != ID_CRTC)
++			return fail(ENOENT);
++		if ((cu->flags & DRM_MODE_CURSOR_BO) && cu->handle != 0)
++			return fail(ENXIO);
++		return 0;
++	}
++	case DRM_IOCTL_PRIME_HANDLE_TO_FD:
++		return do_prime_handle_to_fd(fd, arg);
++	case DRM_IOCTL_PRIME_FD_TO_HANDLE:
++		return do_prime_fd_to_handle(fd, arg);
++	default:
++		return fail(EINVAL);
++	}
++}
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/minix_drm.h b/minix_drm.h
+--- a/minix_drm.h	1970-01-01 02:00:00.000000000 +0200
++++ b/minix_drm.h	2026-11-10 11:18:06.508737697 +0200
+@@ -0,0 +1,9 @@
++/* MINIX: Linux DRM/KMS ioctl emulation over the DRM-lite device. */
++#ifndef MINIX_DRM_H
++#define MINIX_DRM_H
++
++/* Like ioctl(2) on a DRM fd: request is a Linux DRM_IOCTL_* code.  Fds that
++ * are not /dev/drm0 clients are passed to ioctl(2) unchanged. */
++int drm_minix_ioctl(int fd, unsigned long request, void *arg);
++
++#endif
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/xf86drm.c b/xf86drm.c
+--- a/xf86drm.c	2024-08-26 22:10:22.000000000 +0200
++++ b/xf86drm.c	2026-10-31 20:38:30.405985006 +0200
+@@ -96,6 +96,14 @@
+ #endif
+ #endif /* __OpenBSD__ */
+ 
++#ifdef __minix
++/* MINIX DRM-lite (/dev/drm0, <sys/ioc_mdrm.h>).  Every open clones a new
++ * minor, so names are always derived from minor 0, and drmIoctl() goes to
++ * the Linux KMS emulation in minix_drm.c. */
++#include "minix_drm.h"
++#define DRM_MAJOR 18
++#endif
++
+ #ifndef DRM_MAJOR
+ #define DRM_MAJOR 226 /* Linux */
+ #endif
+@@ -700,7 +708,11 @@
+     int ret;
+ 
+     do {
++#ifdef __minix
++        ret = drm_minix_ioctl(fd, request, arg);
++#else
+         ret = ioctl(fd, request, arg);
++#endif
+     } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
+     return ret;
+ }
+@@ -1032,6 +1044,10 @@
+ 
+ static int drmGetMinorType(int major, int minor)
+ {
++#ifdef __minix
++    (void)minor;
++    return major == DRM_MAJOR ? DRM_NODE_PRIMARY : -1;
++#else
+ #ifdef __FreeBSD__
+     char name[SPECNAMELEN];
+     int id;
+@@ -1064,6 +1080,7 @@
+     }
+ 
+     return -1;
++#endif /* !__minix */
+ }
+ 
+ static const char *drmGetMinorName(int type)
+@@ -2684,7 +2701,11 @@
+     timeout.tv_sec++;
+ 
+     do {
++#ifdef __minix
++       ret = drm_minix_ioctl(fd, DRM_IOCTL_WAIT_VBLANK, vbl);
++#else
+        ret = ioctl(fd, DRM_IOCTL_WAIT_VBLANK, vbl);
++#endif
+        vbl->request.type &= ~DRM_VBLANK_RELATIVE;
+        if (ret && errno == EINTR) {
+            clock_gettime(CLOCK_MONOTONIC, &cur);
+@@ -3313,8 +3334,14 @@
+ 
+     for (i = 0; i < DRM_MAX_MINOR; i++) {
+         snprintf(name, sizeof name, DRM_DEV_NAME, DRM_DIR_NAME, i);
++#ifdef __minix
++        /* opens clone minors: match the device node by major */
++        if (stat(name, &sbuf) == 0 && major(sbuf.st_rdev) == major(d))
++            break;
++#else
+         if (stat(name, &sbuf) == 0 && sbuf.st_rdev == d)
+             break;
++#endif
+     }
+     if (i == DRM_MAX_MINOR)
+         return NULL;
+@@ -3517,6 +3544,11 @@
+     if (!dev_name)
+         return NULL;
+ 
++#ifdef __minix
++    if (type != DRM_NODE_PRIMARY)
++        return NULL;            /* no render/control nodes */
++    min = 0;                    /* the device node; opens clone minors */
++#endif
+     n = snprintf(buf, sizeof(buf), dev_name, DRM_DIR_NAME, min);
+     if (n == -1 || n >= sizeof(buf))
+         return NULL;
+@@ -4617,6 +4649,9 @@
+     /* anything longer than this will be truncated in drmDeviceAlloc.
+      * Account for NULL byte
+      */
++#ifdef __minix
++    min = 0;                    /* the device node; opens clone minors */
++#endif
+     n = snprintf(node, PATH_MAX, dev_name, DRM_DIR_NAME, min);
+     if (n == -1 || n >= PATH_MAX)
+       return -errno;
+@@ -4904,6 +4939,9 @@
+     if (!dev_name)
+         return NULL;
+ 
++#ifdef __minix
++    min = 0;                    /* the device node; opens clone minors */
++#endif
+     n = snprintf(node, PATH_MAX, dev_name, DRM_DIR_NAME, min);
+     if (n == -1 || n >= PATH_MAX)
+       return NULL;
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/xf86drm.h b/xf86drm.h
+--- a/xf86drm.h	2024-08-26 22:10:22.000000000 +0200
++++ b/xf86drm.h	2026-11-10 11:18:06.508820097 +0200
+@@ -76,7 +76,7 @@
+ 	(S_IRUSR|S_IWUSR|S_IXUSR|S_IRGRP|S_IXGRP|S_IROTH|S_IXOTH)
+ #define DRM_DEV_MODE	 (S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP)
+ 
+-#ifdef __OpenBSD__
++#if defined(__OpenBSD__) || defined(__minix)
+ #define DRM_DIR_NAME  "/dev"
+ #define DRM_PRIMARY_MINOR_NAME  "drm"
+ #define DRM_CONTROL_MINOR_NAME  "drmC" /* deprecated */
+@@ -833,6 +833,11 @@
+  */
+ extern int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd);
+ extern int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle);
++#ifdef __minix
++/* MINIX: size of a PRIME dma-buf fd (lseek(SEEK_END) cannot tell, as it is a
++ * character device).  Returns 0, or -1 with errno set. */
++extern int drmMinixDmabufSize(int dmabuf_fd, uint64_t *size);
++#endif
+ 
+ extern int drmCloseBufferHandle(int fd, uint32_t handle);
+ 

@@ -1,0 +1,17 @@
+#!/bin/sh
+# i586-elf32-minix-pkg-config - pkg-config wrapper for the merged ports
+# sysroot (see mksysroot.sh): .pc files of the OS (/usr/lib/pkgconfig) and of
+# ports (/usr/pkg/lib/pkgconfig), paths rewritten into the sysroot.
+# Installed as ../minix-ports/tc/bin/i586-elf32-minix-pkg-config.
+set -eu
+# Lives in cross/ and tc/bin/: the ports root is the first parent that has
+# sysroot/.
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+[ -d "$HERE/sysroot" ] || HERE=$(cd "$HERE/.." && pwd)
+SR="$HERE/sysroot"
+
+export PKG_CONFIG_SYSROOT_DIR="$SR"
+export PKG_CONFIG_DIR=
+export PKG_CONFIG_LIBDIR="$SR/usr/pkg/lib/pkgconfig:$SR/usr/pkg/share/pkgconfig:$SR/usr/lib/pkgconfig:$SR/usr/share/pkgconfig"
+export PKG_CONFIG_PATH=
+exec pkg-config "$@"

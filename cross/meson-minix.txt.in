@@ -1,0 +1,27 @@
+# meson cross file for i586-elf32-minix (template; build-port.sh fills in
+# @SYSROOT@ and @TC@ and writes build/<port>/meson-minix.txt).
+[binaries]
+c = '@TC@/i586-elf32-minix-gcc'
+cpp = '@TC@/i586-elf32-minix-g++'
+ar = '@TC@/i586-elf32-minix-ar'
+strip = '@TC@/i586-elf32-minix-strip'
+pkg-config = '@TC@/i586-elf32-minix-pkg-config'
+exe_wrapper = []
+
+[built-in options]
+c_args = ['--sysroot=@SYSROOT@']
+cpp_args = ['--sysroot=@SYSROOT@']
+c_link_args = ['--sysroot=@SYSROOT@', '-Wl,-rpath,/usr/pkg/lib', '-Wl,-z,noexecstack']
+# libstdc++ static (not in the guest); libgcc shared (libgcc_s in
+# /usr/pkg/lib): one emutls and unwinder per process.
+cpp_link_args = ['--sysroot=@SYSROOT@', '-Wl,-rpath,/usr/pkg/lib', '-Wl,-z,noexecstack', '-static-libstdc++']
+
+[properties]
+sys_root = '@SYSROOT@'
+pkg_config_libdir = ['@SYSROOT@/usr/pkg/lib/pkgconfig', '@SYSROOT@/usr/lib/pkgconfig']
+
+[host_machine]
+system = 'minix'
+cpu_family = 'x86'
+cpu = 'i586'
+endian = 'little'

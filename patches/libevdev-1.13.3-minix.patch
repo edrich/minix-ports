@@ -1,0 +1,97 @@
+diff -ruN -x '*.orig' -x '*.rej' a/include/linux/input.h b/include/linux/input.h
+--- a/include/linux/input.h	2024-09-03 05:00:46.000000000 +0200
++++ b/include/linux/input.h	2026-11-01 17:31:40.184488469 +0200
+@@ -2,4 +2,6 @@
+ #include "linux/input.h"
+ #elif __FreeBSD__
+ #include "freebsd/input.h"
++#elif defined(__minix)
++#include "minix/input.h"
+ #endif
+diff -ruN -x '*.orig' -x '*.rej' a/include/linux/minix/input.h b/include/linux/minix/input.h
+--- a/include/linux/minix/input.h	1970-01-01 02:00:00.000000000 +0200
++++ b/include/linux/minix/input.h	2026-11-01 17:31:40.184606599 +0200
+@@ -0,0 +1,11 @@
++/*
++ * MINIX: the Linux evdev ABI as provided by the input server
++ * (<minix/evdev.h>).  FreeBSD's variant of the kernel header uses the BSD
++ * ioctl encoding MINIX shares; requests with an immediate int argument
++ * (_IOWINT, e.g. EVIOCGRAB) take a pointer to the int on MINIX.
++ */
++#include <sys/ioccom.h>
++#ifndef _IOWINT
++#define _IOWINT(g, n)	_IOW(g, n, int)
++#endif
++#include "../freebsd/input.h"
+diff -ruN -x '*.orig' -x '*.rej' a/include/linux/minix/uinput.h b/include/linux/minix/uinput.h
+--- a/include/linux/minix/uinput.h	1970-01-01 02:00:00.000000000 +0200
++++ b/include/linux/minix/uinput.h	2026-11-01 17:31:40.184620839 +0200
+@@ -0,0 +1,11 @@
++/*
++ * MINIX: the Linux evdev ABI as provided by the input server
++ * (<minix/evdev.h>).  FreeBSD's variant of the kernel header uses the BSD
++ * ioctl encoding MINIX shares; requests with an immediate int argument
++ * (_IOWINT, e.g. EVIOCGRAB) take a pointer to the int on MINIX.
++ */
++#include <sys/ioccom.h>
++#ifndef _IOWINT
++#define _IOWINT(g, n)	_IOW(g, n, int)
++#endif
++#include "../freebsd/uinput.h"
+diff -ruN -x '*.orig' -x '*.rej' a/include/linux/uinput.h b/include/linux/uinput.h
+--- a/include/linux/uinput.h	2024-09-03 05:00:46.000000000 +0200
++++ b/include/linux/uinput.h	2026-11-01 17:31:40.184561179 +0200
+@@ -2,4 +2,6 @@
+ #include "linux/uinput.h"
+ #elif __FreeBSD__
+ #include "freebsd/uinput.h"
++#elif defined(__minix)
++#include "minix/uinput.h"
+ #endif
+diff -ruN -x '*.orig' -x '*.rej' a/libevdev/libevdev.c b/libevdev/libevdev.c
+--- a/libevdev/libevdev.c	2024-09-03 05:00:46.000000000 +0200
++++ b/libevdev/libevdev.c	2026-11-01 17:31:40.191713007 +0200
+@@ -1689,9 +1689,24 @@
+ 		return 0;
+ 
+ 	if (grab == LIBEVDEV_GRAB)
++#ifdef __minix
++	{
++		/* MINIX: EVIOCGRAB takes a pointer (see <minix/evdev.h>). */
++		int on = 1;
++		rc = ioctl(dev->fd, EVIOCGRAB, &on);
++	}
++#else
+ 		rc = ioctl(dev->fd, EVIOCGRAB, (void *)1);
++#endif
+ 	else if (grab == LIBEVDEV_UNGRAB)
++#ifdef __minix
++	{
++		int off = 0;
++		rc = ioctl(dev->fd, EVIOCGRAB, &off);
++	}
++#else
+ 		rc = ioctl(dev->fd, EVIOCGRAB, (void *)0);
++#endif
+ 
+ 	if (rc == 0)
+ 		dev->grabbed = grab;
+diff -ruN -x '*.orig' -x '*.rej' a/meson.build b/meson.build
+--- a/meson.build	2024-09-03 05:00:46.000000000 +0200
++++ b/meson.build	2026-11-01 17:32:04.430650042 +0200
+@@ -38,10 +38,12 @@
+ # Dependencies
+ pkgconfig = import('pkgconfig')
+ dep_lm = cc.find_library('m')
+-dep_rt = cc.find_library('rt')
++dep_rt = cc.find_library('rt', required : false)	# not on MINIX (in libc)
+ 
+-input_h = dir_root / 'include' / 'linux' / host_machine.system() / 'input.h'
+-input_event_codes_h = dir_root / 'include' / 'linux' / host_machine.system() / 'input-event-codes.h'
++# MINIX uses FreeBSD's variant of the kernel headers (see include/linux/minix).
++kernel_headers = host_machine.system() == 'minix' ? 'freebsd' : host_machine.system()
++input_h = dir_root / 'include' / 'linux' / kernel_headers / 'input.h'
++input_event_codes_h = dir_root / 'include' / 'linux' / kernel_headers / 'input-event-codes.h'
+ 
+ # event-names.h
+ make_event_names = find_program('libevdev/make-event-names.py')

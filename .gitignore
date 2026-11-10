@@ -1,0 +1,11 @@
+# Generated or downloaded trees: rebuilt by build-toolchain.sh, mksysroot.sh
+# and build-port.sh (sources come from the upstream tarballs + patches/).
+/build/
+/rootfs/
+/sysroot/
+/tc/
+/host/
+/src/
+__pycache__/
+# Gate/probe run outputs (logs, screendumps), rewritten on every run.
+/tests/last-*

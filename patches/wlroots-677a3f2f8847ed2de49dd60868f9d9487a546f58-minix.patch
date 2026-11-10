@@ -1,0 +1,97 @@
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/examples/meson.build b/examples/meson.build
+--- a/examples/meson.build	2023-02-02 23:54:13.000000000 +0200
++++ b/examples/meson.build	2026-11-10 13:03:45.856098862 +0200
+@@ -24,6 +24,7 @@
+ 	libavutil = disabler()
+ endif
+ 
++# MINIX: the 'idle' client is left out (needs pthread_cancel).
+ compositors = {
+ 	'simple': {
+ 		'src': 'simple.c',
+@@ -60,11 +61,6 @@
+ }
+ 
+ clients = {
+-	'idle': {
+-		'src': 'idle.c',
+-		'dep': threads,
+-		'proto': ['kde-idle'],
+-	},
+ 	'idle-inhibit': {
+ 		'src': ['idle-inhibit.c', 'egl_common.c'],
+ 		'dep': [wayland_egl, egl, glesv2],
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/meson.build b/meson.build
+--- a/meson.build	2023-02-02 23:54:13.000000000 +0200
++++ b/meson.build	2026-11-10 13:02:33.626527818 +0200
+@@ -136,7 +136,7 @@
+ 	default_options: ['werror=false'],
+ )
+ math = cc.find_library('m')
+-rt = cc.find_library('rt')
++rt = cc.find_library('rt', required: false)  # MINIX: no librt (clock_gettime is in libc)
+ 
+ wlr_files = []
+ wlr_deps = [
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' a/types/wlr_shm.c b/types/wlr_shm.c
+--- a/types/wlr_shm.c	2023-02-02 23:54:13.000000000 +0200
++++ b/types/wlr_shm.c	2026-11-10 13:03:45.862986532 +0200
+@@ -4,6 +4,7 @@
+ #include <signal.h>
+ #include <stdatomic.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include <sys/mman.h>
+ #include <unistd.h>
+ #include <wayland-server.h>
+@@ -182,6 +183,7 @@
+ 	return true;
+ }
+ 
++#ifdef SA_SIGINFO
+ static void handle_sigbus(int sig, siginfo_t *info, void *context) {
+ 	assert(sigbus_data != NULL);
+ 	struct sigaction prev_action = sigbus_data->prev_action;
+@@ -219,6 +221,7 @@
+ 		prev_action.sa_handler(sig);
+ 	}
+ }
++#endif /* SA_SIGINFO */
+ 
+ static bool buffer_begin_data_ptr_access(struct wlr_buffer *wlr_buffer,
+ 		uint32_t flags, void **data, uint32_t *format, size_t *stride) {
+@@ -231,7 +234,10 @@
+ 
+ 	// Install a SIGBUS handler. SIGBUS is triggered if the client shrinks the
+ 	// backing file, and then we try to access the mapping.
++	// MINIX: no SA_SIGINFO, so the faulting address is unknown: no handler
++	// (a client that shrinks its pool can crash the compositor).
+ 	struct sigaction prev_action;
++#ifdef SA_SIGINFO
+ 	if (sigbus_data == NULL) {
+ 		struct sigaction new_action = {
+ 			.sa_sigaction = handle_sigbus,
+@@ -244,6 +250,9 @@
+ 	} else {
+ 		prev_action = sigbus_data->prev_action;
+ 	}
++#else
++	memset(&prev_action, 0, sizeof(prev_action));
++#endif
+ 
+ 	struct wlr_shm_mapping *mapping = buffer->pool->mapping;
+ 
+@@ -274,11 +283,13 @@
+ 		}
+ 	}
+ 
++#ifdef SA_SIGINFO
+ 	if (sigbus_data == NULL) {
+ 		if (sigaction(SIGBUS, &buffer->sigbus_data.prev_action, NULL) != 0) {
+ 			wlr_log_errno(WLR_ERROR, "sigaction failed");
+ 		}
+ 	}
++#endif
+ 
+ 	mapping_consider_destroy(buffer->sigbus_data.mapping);
+ }
