@@ -46,6 +46,10 @@ check "desktop user in group operator" 'id desk | grep -q "groups=.*0("'
 check "rc.d script installed, off by default" \
 	'[ -x /etc/rc.d/hyprland ] && grep -q "^hyprland=NO" /etc/rc.conf'
 check "not running after boot" "! $S status > /dev/null"
+check "network up at boot (DHCP on em0)" \
+	"waitfor 30 'ifconfig em0 2>/dev/null | grep -q \"inet 10\\.0\\.2\\.\"'"
+check "git and curl for the desktop user" \
+	'su -l desk -c "git --version && curl --version" > /dev/null'
 $S; check "start-hyprland" "[ $? = 0 ]"
 check "status" "$S status"
 check "Hyprland runs as desk" '[ "$(owner /usr/pkg/bin/Hyprland)" = desk ]'

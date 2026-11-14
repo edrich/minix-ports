@@ -1,7 +1,7 @@
 #!/bin/sh
 # install.sh - run in the guest by run-hyprland.sh (payload on /mnt, ports
 # already copied to /usr/pkg): install the session files and make the
-# desktop user.  Safe to run again.
+# desktop user, configure the network.  Safe to run again.
 set -e
 D=$(dirname "$0")
 cp "$D/start-hyprland.sh" /usr/pkg/bin/start-hyprland
@@ -13,5 +13,8 @@ grep -q '^hyprland=' /etc/rc.conf || echo 'hyprland=NO' >> /etc/rc.conf
 # /dev/drm0 and /dev/input/event*.  No password: reached with su from root.
 id desk > /dev/null 2>&1 || useradd -m -g users -G operator -c "Desktop user" desk
 id desk
+# Network: DHCP on the first e1000 interface at boot (what netconf(8)
+# writes; QEMU's default NIC model).  Harmless without a NIC.
+[ -f /etc/ifconfig.em0 ] || printf 'up\n!dhcpcd -qM -4 $int\n' > /etc/ifconfig.em0
 sync
 echo DESKTOP-INSTALLED

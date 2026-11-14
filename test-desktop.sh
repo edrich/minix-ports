@@ -32,7 +32,7 @@ rc=0
 boot() {	# <log suffix> <image> <harness args...>
 	l=$1 i=$2; shift 2
 	"$REPO/releasetools/x86_qemu.py" --image "$i" --bootdir "$BOOTDIR" \
-		--payload "$WORK/payload" --timeout 900 "$@" \
+		--payload "$WORK/payload" --net --timeout 900 "$@" \
 		--expect 'HARNESS:DONE:0' --log "$WORK/$l.log" > /dev/null || rc=1
 	cat "$WORK/$l.log" >> "$LOG"
 }

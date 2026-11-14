@@ -6,7 +6,7 @@
 #     build/desktop/minix-desktop.img and install rootfs/usr/pkg (stripped,
 #     via stage-payload.sh) plus the session files of desktop/ into it
 #     (desktop/install.sh: start-hyprland, /etc/rc.d/hyprland, the desktop
-#     user "desk"), using the headless harness with --persist.  Redone
+#     user "desk", DHCP on em0), using the headless harness with --persist.  Redone
 #     whenever the base image, rootfs/usr/pkg or desktop/ is newer than the
 #     desktop image.
 #  2. Boot it: serial console (root login, no password) in this terminal,
@@ -20,6 +20,8 @@
 #      PERSIST=1 (keep guest changes; default snapshot - crashed
 #      compositors' core dumps otherwise fill the root fs)
 #      NOVIEWER=1 (do not start a VNC viewer)
+#      NONET=1 (no NIC; default: e1000 on QEMU user-mode networking, the
+#      guest configures it by DHCP at boot - curl and git https work)
 # Args: prepare (only step 1, forced).  Gate: test-desktop.sh.
 set -eu
 
@@ -82,10 +84,13 @@ EOF
 snap=,snapshot=on; [ -n "${PERSIST:-}" ] && snap=
 mods=$(cd "$BOOTDIR" && ls mod* | sort | tr '\n' ',' | sed 's/,$//')
 cd "$BOOTDIR"
+net="-netdev user,id=net0 -device e1000,netdev=net0"
+[ -n "${NONET:-}" ] && net=
 accel=tcg; [ -r /dev/kvm ] && [ -w /dev/kvm ] && accel=kvm
 exec qemu-system-i386 -machine pc -accel $accel -m "$MEM" -vga std \
 	-display none -vnc 127.0.0.1:$VNC -no-reboot \
 	-serial mon:stdio \
 	-kernel kernel -initrd "$mods" \
 	-append "rootdevname=c0d0p0 console=tty00" \
+	$net \
 	-drive "file=$IMG,format=raw,if=ide,index=0,media=disk$snap"

@@ -153,6 +153,30 @@ for p in libffi wayland wayland-protocols pixman xkeyboard-config \
 ./test-weston.sh            # Weston desktop gate (Phase 6)
 ```
 
+## Command line applications (git, curl)
+
+```
+./build-port.sh zlib; ./build-port.sh openssl; ./build-port.sh curl
+./build-port.sh git
+./test-git.sh               # gate: local git work + https clone (needs network)
+NONET=1 ./test-git.sh       # local part only
+```
+
+- `zlib` 1.3.1 and `openssl` 3.5.4 are installed in `/usr/pkg` next to the
+  base system's much older ones (zlib 1.2.3, OpenSSL 1.0.1p); ports find
+  them first through the `-I`/`-L` order and the `/usr/pkg/lib` RPATH.
+- `curl` 8.17.0: static libcurl, OpenSSL TLS, Mozilla's CA bundle in
+  `/usr/pkg/etc/ssl/cert.pem` (fetched from curl.se at build time, kept in
+  `src/cacert.pem`; delete that file to refresh it).
+- `git` 2.52.0: https remotes through libcurl; no ssh in the MINIX base
+  system, so no `ssh://` remotes yet.  Built without threads, mmap, iconv,
+  perl, python, Tcl/Tk and gettext (see `ports/git.sh`).  Needs a MINIX
+  libc with `getpgid()` (minix repo, docs/UPDATING 20261114).
+- Network in QEMU: the harness option `--net` (and `run-hyprland.sh` by
+  default) attaches an e1000 NIC on user-mode networking; in the guest
+  `dhcpcd -qM -4 -w em0` configures it (the desktop image does so at boot
+  through `/etc/ifconfig.em0`).
+
 ## Desktop image (Hyprland session)
 
 `run-hyprland.sh` makes `build/desktop/minix-desktop.img` (the OS image +
@@ -176,6 +200,8 @@ with the screen on VNC and the serial console in the terminal:
 - `desktop/install.sh` (run in the guest by the prepare step): user
   `desk` (`useradd -G operator`: /dev/drm0 and /dev/input/event* are
   root:operator 660; operator is gid 0 on MINIX, so `ls` shows "wheel"),
-  `/etc/rc.d/hyprland` + `hyprland=NO` in `/etc/rc.conf`.
+  `/etc/rc.d/hyprland` + `hyprland=NO` in `/etc/rc.conf`,
+  `/etc/ifconfig.em0` (DHCP at boot; `NONET=1 ./run-hyprland.sh` boots
+  without a NIC).  git and curl are in the user's PATH (`/usr/pkg/bin`).
 - While Hyprland runs it owns keyboard and mouse: the VGA text console
   gets no keys.  Serial console and network logins are unaffected.
