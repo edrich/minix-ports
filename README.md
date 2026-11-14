@@ -153,7 +153,7 @@ for p in libffi wayland wayland-protocols pixman xkeyboard-config \
 ./test-weston.sh            # Weston desktop gate (Phase 6)
 ```
 
-## Command line applications (git, curl, vim)
+## Applications (git, curl, vim, links, NetSurf)
 
 ```
 ./build-port.sh zlib; ./build-port.sh openssl; ./build-port.sh curl
@@ -180,6 +180,30 @@ NONET=1 ./test-git.sh       # local part only
   system, so no `ssh://` remotes yet.  Built without threads, mmap, iconv,
   perl, python, Tcl/Tk and gettext (see `ports/git.sh`).  Needs a MINIX
   libc with `getpgid()` (minix repo, docs/UPDATING 20261114).
+- `links` 2.30: text-mode browser for the terminal (https, no graphics
+  mode).  `./test-links.sh`.
+
+### NetSurf (graphical browser)
+
+```
+./build-port.sh libjpeg-turbo; ./build-port.sh netsurf
+./test-netsurf.sh           # gate: click, typed URL, resize, https, close
+  desk$ netsurf-fb -f wl https://example.com/     # or MOD+B in the session
+```
+
+- NetSurf 3.11's framebuffer frontend (`/usr/pkg/bin/netsurf-fb`) on a
+  Wayland window.  `patches/netsurf-3.11-minix.patch` adds the libnsfb
+  surface `wlxdg.c` (xdg-shell + wl_shm; libnsfb's own Wayland surface
+  uses the obsolete wl_shell): tiled/resized by the compositor, pointer,
+  keyboard (US layout) with key repeat.
+- HTML/CSS engine of NetSurf, https through curl + openssl, PNG, GIF, BMP,
+  SVG and JPEG (`libjpeg-turbo`, static).  JavaScript (Duktape) is built
+  in but off by default: `enable_javascript:1` in `~/.netsurf/Choices`.
+  Good for documentation and simple sites, not for web applications.
+- The build needs a host libpng for one of NetSurf's build tools; the
+  recipe builds a static one into `host/` from the libpng port's tarball
+  (build the `libpng` port first).
+
 - Network in QEMU: the harness option `--net` (and `run-hyprland.sh` by
   default) attaches an e1000 NIC on user-mode networking; in the guest
   `dhcpcd -qM -4 -w em0` configures it (the desktop image does so at boot

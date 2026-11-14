@@ -17,6 +17,7 @@
 #
 # Keys (MOD = SUPER or ALT; ALT for when the host eats SUPER):
 #   MOD+Return  foot terminal        MOD+Q        close window
+#   MOD+B       NetSurf browser
 #   MOD+F       fullscreen           MOD+V        toggle floating
 #   MOD+arrows  move focus           MOD+1..4     workspace 1..4
 #   MOD+SHIFT+1..4  move window to workspace     MOD+SHIFT+E  exit
@@ -34,7 +35,7 @@ enable|disable)
 	echo "hyprland=$v in /etc/rc.conf"
 	exit 0 ;;
 start|stop|status|ctl) ;;
-*)	sed -n '2,23p' $0; exit 1 ;;
+*)	sed -n '2,24p' $0; exit 1 ;;
 esac
 
 if [ "$(id -u)" = 0 ] && [ "$DUSER" != root ] && id "$DUSER" > /dev/null 2>&1
@@ -115,6 +116,7 @@ CFG
 	for m in SUPER ALT; do
 		cat <<CFG
 bind = $m, Return, exec, /usr/pkg/bin/foot > /tmp/foot-$ME.log 2>&1
+bind = $m, B, exec, /usr/pkg/bin/netsurf-fb -f wl > /tmp/netsurf-$ME.log 2>&1
 bind = $m, Q, killactive,
 bind = $m SHIFT, E, exit,
 bind = $m, F, fullscreen, 0

@@ -1,0 +1,955 @@
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' -x Messages a/libnsfb/src/plot.h b/libnsfb/src/plot.h
+--- a/libnsfb/src/plot.h	2023-12-28 02:57:22.315338000 +0200
++++ b/libnsfb/src/plot.h	2026-11-14 13:25:01.114072155 +0200
+@@ -35,7 +35,7 @@
+     #if __DARWIN_BYTE_ORDER == __DARWIN_BIG_ENDIAN
+         #define NSFB_BE_BYTE_ORDER
+     #endif
+-#elif defined(__FreeBSD__)
++#elif defined(__FreeBSD__) || defined(__minix)
+     /* freebsd has the include somewhere different */
+     #include <machine/endian.h>
+     #if defined(_BYTE_ORDER)
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' -x Messages a/libnsfb/src/surface/Makefile b/libnsfb/src/surface/Makefile
+--- a/libnsfb/src/surface/Makefile	2023-12-28 02:57:22.315338000 +0200
++++ b/libnsfb/src/surface/Makefile	2026-11-14 13:25:01.114334005 +0200
+@@ -7,7 +7,9 @@
+ SURFACE_HANDLER_$(NSFB_SDL_AVAILABLE) += sdl.c
+ SURFACE_HANDLER_$(NSFB_XCB_AVAILABLE) += x.c
+ SURFACE_HANDLER_$(NSFB_VNC_AVAILABLE) += vnc.c
+-SURFACE_HANDLER_$(NSFB_WLD_AVAILABLE) += wld.c
++# MINIX ports: xdg-shell surface (wlxdg.c) instead of the wl_shell one
++# (wld.c); xdg-shell-protocol.c comes from wayland-scanner (ports/netsurf.sh)
++SURFACE_HANDLER_$(NSFB_WLD_AVAILABLE) += wlxdg.c xdg-shell-protocol.c
+ 
+ DIR_SOURCES := $(SURFACE_HANDLER_yes)
+ 
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' -x Messages a/libnsfb/src/surface/wlxdg.c b/libnsfb/src/surface/wlxdg.c
+--- a/libnsfb/src/surface/wlxdg.c	1970-01-01 02:00:00.000000000 +0200
++++ b/libnsfb/src/surface/wlxdg.c	2026-11-14 13:25:01.114404535 +0200
+@@ -0,0 +1,912 @@
++/*
++ * Wayland surface for libnsfb: an xdg-shell toplevel with wl_shm buffers.
++ *
++ * Written for the MINIX ports (the stock wld.c surface speaks wl_shell,
++ * which current compositors no longer offer).  Registered under the same
++ * type, NSFB_SURFACE_WL, with the name "wl".
++ *
++ * Model: nsfb->ptr is an ordinary heap framebuffer (XRGB8888, which is
++ * wl_shm's XRGB8888 on little endian machines).  update() only collects
++ * damage; the frame goes out from input(): copied into one of two shm
++ * buffers, attached and committed, at most one commit per compositor frame
++ * callback.  Compositor-driven size changes become NSFB_EVENT_RESIZE; the
++ * client answers with nsfb_set_geometry().
++ *
++ * Input: pointer motion/buttons/wheel, keyboard keys as libnsfb key codes
++ * of the unshifted US key (the framebuffer toolkit applies the modifiers
++ * itself, as with the X and SDL surfaces), with client-side key repeat.
++ * The compositor's pointer image is hidden: libnsfb draws its own cursor.
++ *
++ * Licenced under the MIT License,
++ *                http://www.opensource.org/licenses/mit-license.php
++ */
++
++#define _NETBSD_SOURCE 1	/* mkstemp() etc. next to _POSIX_C_SOURCE */
++
++#include <sys/mman.h>
++#include <sys/time.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <wayland-client.h>
++#include "xdg-shell-client-protocol.h"
++
++#include "libnsfb.h"
++#include "libnsfb_event.h"
++#include "libnsfb_plot.h"
++#include "libnsfb_plot_util.h"
++
++#include "nsfb.h"
++#include "surface.h"
++#include "plot.h"
++#include "cursor.h"
++
++#define UNUSED(x) ((x) = (x))
++
++#define NBUF		2
++#define EVQ_SIZE	256
++#define REPEAT_DELAY	500	/* ms */
++#define REPEAT_RATE	40	/* ms */
++
++struct wlbuf {
++    struct wl_buffer *buffer;
++    void *data;
++    size_t size;
++    int width, height;
++    bool busy;			/* held by the compositor */
++};
++
++struct wlstate {
++    nsfb_t *nsfb;
++    struct wl_display *display;
++    struct wl_registry *registry;
++    struct wl_compositor *compositor;
++    struct wl_shm *shm;
++    struct xdg_wm_base *wm_base;
++    struct wl_seat *seat;
++    struct wl_pointer *pointer;
++    struct wl_keyboard *keyboard;
++
++    struct wl_surface *surface;
++    struct xdg_surface *xdg_surface;
++    struct xdg_toplevel *toplevel;
++    struct wl_callback *frame;	/* outstanding frame callback */
++
++    bool configured;		/* first configure seen */
++    bool closed;		/* close request or connection lost */
++    int conf_w, conf_h;		/* size of the last toplevel configure */
++
++    struct wlbuf bufs[NBUF];
++    bool dirty;			/* damage waiting for a commit */
++    nsfb_bbox_t damage;
++
++    nsfb_event_t evq[EVQ_SIZE];
++    int evhead, evcount;
++
++    enum nsfb_key_code_e repeat_key;	/* NSFB_KEY_UNKNOWN: none */
++    long long repeat_at;		/* ms */
++};
++
++static long long now_ms(void)
++{
++    struct timeval tv;
++
++    gettimeofday(&tv, NULL);
++    return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
++}
++
++static void push_event(struct wlstate *ws, const nsfb_event_t *ev)
++{
++    if (ws->evcount == EVQ_SIZE) {
++	/* full: drop the oldest (pointer motion, most likely) */
++	ws->evhead = (ws->evhead + 1) % EVQ_SIZE;
++	ws->evcount--;
++    }
++    ws->evq[(ws->evhead + ws->evcount) % EVQ_SIZE] = *ev;
++    ws->evcount++;
++}
++
++static bool pop_event(struct wlstate *ws, nsfb_event_t *ev)
++{
++    if (ws->evcount == 0)
++	return false;
++    *ev = ws->evq[ws->evhead];
++    ws->evhead = (ws->evhead + 1) % EVQ_SIZE;
++    ws->evcount--;
++    return true;
++}
++
++static void push_key(struct wlstate *ws, bool down, enum nsfb_key_code_e code)
++{
++    nsfb_event_t ev;
++
++    memset(&ev, 0, sizeof(ev));
++    ev.type = down ? NSFB_EVENT_KEY_DOWN : NSFB_EVENT_KEY_UP;
++    ev.value.keycode = code;
++    push_event(ws, &ev);
++}
++
++/* ---- shm buffers ---- */
++
++static void buffer_release(void *data, struct wl_buffer *buffer)
++{
++    struct wlbuf *b = data;
++
++    UNUSED(buffer);
++    b->busy = false;
++}
++
++static const struct wl_buffer_listener buffer_listener = { buffer_release };
++
++static void buf_destroy(struct wlbuf *b)
++{
++    if (b->buffer != NULL)
++	wl_buffer_destroy(b->buffer);
++    if (b->data != NULL)
++	munmap(b->data, b->size);
++    memset(b, 0, sizeof(*b));
++}
++
++static int shm_file(size_t size)
++{
++    char name[256];
++    const char *dir = getenv("XDG_RUNTIME_DIR");
++    int fd;
++
++    snprintf(name, sizeof(name), "%s/nsfb-shm-XXXXXX",
++	     dir != NULL ? dir : "/tmp");
++    fd = mkstemp(name);
++    if (fd < 0)
++	return -1;
++    unlink(name);
++    fcntl(fd, F_SETFD, FD_CLOEXEC);
++    if (ftruncate(fd, size) < 0) {
++	close(fd);
++	return -1;
++    }
++    return fd;
++}
++
++static bool buf_create(struct wlstate *ws, struct wlbuf *b, int w, int h)
++{
++    struct wl_shm_pool *pool;
++    int fd;
++
++    buf_destroy(b);
++    b->size = (size_t)w * h * 4;
++    fd = shm_file(b->size);
++    if (fd < 0)
++	return false;
++    b->data = mmap(NULL, b->size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    if (b->data == MAP_FAILED) {
++	b->data = NULL;
++	close(fd);
++	return false;
++    }
++    pool = wl_shm_create_pool(ws->shm, fd, b->size);
++    b->buffer = wl_shm_pool_create_buffer(pool, 0, w, h, w * 4,
++					  WL_SHM_FORMAT_XRGB8888);
++    wl_shm_pool_destroy(pool);
++    close(fd);
++    wl_buffer_add_listener(b->buffer, &buffer_listener, b);
++    b->width = w;
++    b->height = h;
++    b->busy = false;
++    return true;
++}
++
++/* ---- presenting ---- */
++
++static void frame_done(void *data, struct wl_callback *cb, uint32_t time)
++{
++    struct wlstate *ws = data;
++
++    UNUSED(time);
++    wl_callback_destroy(cb);
++    if (ws->frame == cb)
++	ws->frame = NULL;
++}
++
++static const struct wl_callback_listener frame_listener = { frame_done };
++
++/* Send the framebuffer to the compositor if there is damage and we may. */
++static void present(struct wlstate *ws)
++{
++    nsfb_t *nsfb = ws->nsfb;
++    struct wlbuf *b = NULL;
++    int i;
++
++    if (!ws->dirty || !ws->configured || ws->closed || ws->frame != NULL ||
++	nsfb->ptr == NULL)
++	return;
++
++    for (i = 0; i < NBUF; i++) {
++	if (!ws->bufs[i].busy) {
++	    b = &ws->bufs[i];
++	    break;
++	}
++    }
++    if (b == NULL)
++	return;		/* both with the compositor: wait for a release */
++
++    if (b->buffer == NULL || b->width != nsfb->width ||
++	b->height != nsfb->height) {
++	if (!buf_create(ws, b, nsfb->width, nsfb->height))
++	    return;
++    }
++
++    /* The other buffer may be older than the previous frame: copy all. */
++    memcpy(b->data, nsfb->ptr, b->size);
++
++    wl_surface_attach(ws->surface, b->buffer, 0, 0);
++    wl_surface_damage(ws->surface, ws->damage.x0, ws->damage.y0,
++		      ws->damage.x1 - ws->damage.x0,
++		      ws->damage.y1 - ws->damage.y0);
++    ws->frame = wl_surface_frame(ws->surface);
++    wl_callback_add_listener(ws->frame, &frame_listener, ws);
++    wl_surface_commit(ws->surface);
++    b->busy = true;
++    ws->dirty = false;
++}
++
++static void add_damage(struct wlstate *ws, const nsfb_bbox_t *box)
++{
++    nsfb_bbox_t full, b = *box;
++
++    full.x0 = 0;
++    full.y0 = 0;
++    full.x1 = ws->nsfb->width;
++    full.y1 = ws->nsfb->height;
++    if (!nsfb_plot_clip(&full, &b))
++	return;
++    if (!ws->dirty) {
++	ws->damage = b;
++	ws->dirty = true;
++    } else {
++	nsfb_plot_add_rect(&ws->damage, &b, &ws->damage);
++    }
++}
++
++/* ---- xdg-shell ---- */
++
++static void wm_ping(void *data, struct xdg_wm_base *base, uint32_t serial)
++{
++    UNUSED(data);
++    xdg_wm_base_pong(base, serial);
++}
++
++static const struct xdg_wm_base_listener wm_listener = { wm_ping };
++
++static void
++xsurf_configure(void *data, struct xdg_surface *xs, uint32_t serial)
++{
++    struct wlstate *ws = data;
++    nsfb_t *nsfb = ws->nsfb;
++
++    xdg_surface_ack_configure(xs, serial);
++    if (!ws->configured) {
++	ws->configured = true;	/* initialise() adopts conf_w/conf_h */
++	return;
++    }
++    if (ws->conf_w > 0 && ws->conf_h > 0 &&
++	(ws->conf_w != nsfb->width || ws->conf_h != nsfb->height)) {
++	nsfb_event_t ev;
++
++	memset(&ev, 0, sizeof(ev));
++	ev.type = NSFB_EVENT_RESIZE;
++	ev.value.resize.w = ws->conf_w;
++	ev.value.resize.h = ws->conf_h;
++	push_event(ws, &ev);
++    }
++}
++
++static const struct xdg_surface_listener xsurf_listener = { xsurf_configure };
++
++static void
++top_configure(void *data, struct xdg_toplevel *top, int32_t w, int32_t h,
++	      struct wl_array *states)
++{
++    struct wlstate *ws = data;
++
++    UNUSED(top);
++    UNUSED(states);
++    ws->conf_w = w;
++    ws->conf_h = h;
++}
++
++static void top_close(void *data, struct xdg_toplevel *top)
++{
++    struct wlstate *ws = data;
++    nsfb_event_t ev;
++
++    UNUSED(top);
++    memset(&ev, 0, sizeof(ev));
++    ev.type = NSFB_EVENT_CONTROL;
++    ev.value.controlcode = NSFB_CONTROL_QUIT;
++    push_event(ws, &ev);
++}
++
++static const struct xdg_toplevel_listener top_listener = {
++    top_configure, top_close
++};
++
++/* ---- pointer ---- */
++
++static void push_motion(struct wlstate *ws, wl_fixed_t sx, wl_fixed_t sy)
++{
++    nsfb_event_t ev;
++
++    memset(&ev, 0, sizeof(ev));
++    ev.type = NSFB_EVENT_MOVE_ABSOLUTE;
++    ev.value.vector.x = wl_fixed_to_int(sx);
++    ev.value.vector.y = wl_fixed_to_int(sy);
++    ev.value.vector.z = 0;
++    push_event(ws, &ev);
++}
++
++static void
++ptr_enter(void *data, struct wl_pointer *p, uint32_t serial,
++	  struct wl_surface *surf, wl_fixed_t sx, wl_fixed_t sy)
++{
++    struct wlstate *ws = data;
++
++    UNUSED(surf);
++    /* libnsfb plots its own pointer into the framebuffer */
++    wl_pointer_set_cursor(p, serial, NULL, 0, 0);
++    push_motion(ws, sx, sy);
++}
++
++static void
++ptr_leave(void *data, struct wl_pointer *p, uint32_t serial,
++	  struct wl_surface *surf)
++{
++    UNUSED(data);
++    UNUSED(p);
++    UNUSED(serial);
++    UNUSED(surf);
++}
++
++static void
++ptr_motion(void *data, struct wl_pointer *p, uint32_t time, wl_fixed_t sx,
++	   wl_fixed_t sy)
++{
++    UNUSED(p);
++    UNUSED(time);
++    push_motion(data, sx, sy);
++}
++
++static void
++ptr_button(void *data, struct wl_pointer *p, uint32_t serial, uint32_t time,
++	   uint32_t button, uint32_t state)
++{
++    enum nsfb_key_code_e code;
++
++    UNUSED(p);
++    UNUSED(serial);
++    UNUSED(time);
++    switch (button) {
++    case 0x110: code = NSFB_KEY_MOUSE_1; break;		/* BTN_LEFT */
++    case 0x112: code = NSFB_KEY_MOUSE_2; break;		/* BTN_MIDDLE */
++    case 0x111: code = NSFB_KEY_MOUSE_3; break;		/* BTN_RIGHT */
++    default: return;
++    }
++    push_key(data, state == WL_POINTER_BUTTON_STATE_PRESSED, code);
++}
++
++static void
++ptr_axis(void *data, struct wl_pointer *p, uint32_t time, uint32_t axis,
++	 wl_fixed_t value)
++{
++    enum nsfb_key_code_e code;
++
++    UNUSED(p);
++    UNUSED(time);
++    if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL || value == 0)
++	return;
++    code = value < 0 ? NSFB_KEY_MOUSE_4 : NSFB_KEY_MOUSE_5;
++    push_key(data, true, code);
++    push_key(data, false, code);
++}
++
++static const struct wl_pointer_listener pointer_listener = {
++    ptr_enter, ptr_leave, ptr_motion, ptr_button, ptr_axis
++};
++
++/* ---- keyboard ---- */
++
++/* Linux input key codes (what wl_keyboard.key carries) -> libnsfb codes */
++static enum nsfb_key_code_e evdev_to_nsfb(uint32_t key)
++{
++    static const short map[128] = {
++	[1] = NSFB_KEY_ESCAPE,
++	[2] = NSFB_KEY_1, [3] = NSFB_KEY_2, [4] = NSFB_KEY_3,
++	[5] = NSFB_KEY_4, [6] = NSFB_KEY_5, [7] = NSFB_KEY_6,
++	[8] = NSFB_KEY_7, [9] = NSFB_KEY_8, [10] = NSFB_KEY_9,
++	[11] = NSFB_KEY_0, [12] = NSFB_KEY_MINUS, [13] = NSFB_KEY_EQUALS,
++	[14] = NSFB_KEY_BACKSPACE, [15] = NSFB_KEY_TAB,
++	[16] = NSFB_KEY_q, [17] = NSFB_KEY_w, [18] = NSFB_KEY_e,
++	[19] = NSFB_KEY_r, [20] = NSFB_KEY_t, [21] = NSFB_KEY_y,
++	[22] = NSFB_KEY_u, [23] = NSFB_KEY_i, [24] = NSFB_KEY_o,
++	[25] = NSFB_KEY_p, [26] = NSFB_KEY_LEFTBRACKET,
++	[27] = NSFB_KEY_RIGHTBRACKET, [28] = NSFB_KEY_RETURN,
++	[29] = NSFB_KEY_LCTRL,
++	[30] = NSFB_KEY_a, [31] = NSFB_KEY_s, [32] = NSFB_KEY_d,
++	[33] = NSFB_KEY_f, [34] = NSFB_KEY_g, [35] = NSFB_KEY_h,
++	[36] = NSFB_KEY_j, [37] = NSFB_KEY_k, [38] = NSFB_KEY_l,
++	[39] = NSFB_KEY_SEMICOLON, [40] = NSFB_KEY_QUOTE,
++	[41] = NSFB_KEY_BACKQUOTE, [42] = NSFB_KEY_LSHIFT,
++	[43] = NSFB_KEY_BACKSLASH,
++	[44] = NSFB_KEY_z, [45] = NSFB_KEY_x, [46] = NSFB_KEY_c,
++	[47] = NSFB_KEY_v, [48] = NSFB_KEY_b, [49] = NSFB_KEY_n,
++	[50] = NSFB_KEY_m, [51] = NSFB_KEY_COMMA, [52] = NSFB_KEY_PERIOD,
++	[53] = NSFB_KEY_SLASH, [54] = NSFB_KEY_RSHIFT,
++	[55] = NSFB_KEY_KP_MULTIPLY, [56] = NSFB_KEY_LALT,
++	[57] = NSFB_KEY_SPACE, [58] = NSFB_KEY_CAPSLOCK,
++	[59] = NSFB_KEY_F1, [60] = NSFB_KEY_F2, [61] = NSFB_KEY_F3,
++	[62] = NSFB_KEY_F4, [63] = NSFB_KEY_F5, [64] = NSFB_KEY_F6,
++	[65] = NSFB_KEY_F7, [66] = NSFB_KEY_F8, [67] = NSFB_KEY_F9,
++	[68] = NSFB_KEY_F10, [69] = NSFB_KEY_NUMLOCK,
++	[70] = NSFB_KEY_SCROLLOCK,
++	[71] = NSFB_KEY_KP7, [72] = NSFB_KEY_KP8, [73] = NSFB_KEY_KP9,
++	[74] = NSFB_KEY_KP_MINUS, [75] = NSFB_KEY_KP4, [76] = NSFB_KEY_KP5,
++	[77] = NSFB_KEY_KP6, [78] = NSFB_KEY_KP_PLUS, [79] = NSFB_KEY_KP1,
++	[80] = NSFB_KEY_KP2, [81] = NSFB_KEY_KP3, [82] = NSFB_KEY_KP0,
++	[83] = NSFB_KEY_KP_PERIOD,
++	[87] = NSFB_KEY_F11, [88] = NSFB_KEY_F12,
++	[96] = NSFB_KEY_KP_ENTER, [97] = NSFB_KEY_RCTRL,
++	[98] = NSFB_KEY_KP_DIVIDE, [99] = NSFB_KEY_SYSREQ,
++	[100] = NSFB_KEY_RALT,
++	[102] = NSFB_KEY_HOME, [103] = NSFB_KEY_UP, [104] = NSFB_KEY_PAGEUP,
++	[105] = NSFB_KEY_LEFT, [106] = NSFB_KEY_RIGHT, [107] = NSFB_KEY_END,
++	[108] = NSFB_KEY_DOWN, [109] = NSFB_KEY_PAGEDOWN,
++	[110] = NSFB_KEY_INSERT, [111] = NSFB_KEY_DELETE,
++	[119] = NSFB_KEY_PAUSE, [125] = NSFB_KEY_LSUPER,
++	[126] = NSFB_KEY_RSUPER, [127] = NSFB_KEY_MENU,
++    };
++
++    if (key >= sizeof(map) / sizeof(map[0]))
++	return NSFB_KEY_UNKNOWN;
++    return (enum nsfb_key_code_e)map[key];
++}
++
++static bool is_modifier(enum nsfb_key_code_e code)
++{
++    return code >= NSFB_KEY_NUMLOCK && code <= NSFB_KEY_COMPOSE;
++}
++
++static void
++kbd_keymap(void *data, struct wl_keyboard *k, uint32_t format, int32_t fd,
++	   uint32_t size)
++{
++    UNUSED(data);
++    UNUSED(k);
++    UNUSED(format);
++    UNUSED(size);
++    close(fd);		/* fixed US mapping, see evdev_to_nsfb() */
++}
++
++static void
++kbd_enter(void *data, struct wl_keyboard *k, uint32_t serial,
++	  struct wl_surface *surf, struct wl_array *keys)
++{
++    UNUSED(data);
++    UNUSED(k);
++    UNUSED(serial);
++    UNUSED(surf);
++    UNUSED(keys);
++}
++
++static void
++kbd_leave(void *data, struct wl_keyboard *k, uint32_t serial,
++	  struct wl_surface *surf)
++{
++    struct wlstate *ws = data;
++
++    UNUSED(k);
++    UNUSED(serial);
++    UNUSED(surf);
++    ws->repeat_key = NSFB_KEY_UNKNOWN;
++}
++
++static void
++kbd_key(void *data, struct wl_keyboard *k, uint32_t serial, uint32_t time,
++	uint32_t key, uint32_t state)
++{
++    struct wlstate *ws = data;
++    enum nsfb_key_code_e code = evdev_to_nsfb(key);
++    bool down = state == WL_KEYBOARD_KEY_STATE_PRESSED;
++
++    UNUSED(k);
++    UNUSED(serial);
++    UNUSED(time);
++    if (code == NSFB_KEY_UNKNOWN)
++	return;
++    push_key(ws, down, code);
++    if (down && !is_modifier(code)) {
++	ws->repeat_key = code;
++	ws->repeat_at = now_ms() + REPEAT_DELAY;
++    } else if (!down && code == ws->repeat_key) {
++	ws->repeat_key = NSFB_KEY_UNKNOWN;
++    }
++}
++
++static void
++kbd_modifiers(void *data, struct wl_keyboard *k, uint32_t serial,
++	      uint32_t depressed, uint32_t latched, uint32_t locked,
++	      uint32_t group)
++{
++    UNUSED(data);
++    UNUSED(k);
++    UNUSED(serial);
++    UNUSED(depressed);
++    UNUSED(latched);
++    UNUSED(locked);
++    UNUSED(group);
++}
++
++static const struct wl_keyboard_listener keyboard_listener = {
++    kbd_keymap, kbd_enter, kbd_leave, kbd_key, kbd_modifiers
++};
++
++static void seat_caps(void *data, struct wl_seat *seat, uint32_t caps)
++{
++    struct wlstate *ws = data;
++
++    if ((caps & WL_SEAT_CAPABILITY_POINTER) && ws->pointer == NULL) {
++	ws->pointer = wl_seat_get_pointer(seat);
++	wl_pointer_add_listener(ws->pointer, &pointer_listener, ws);
++    }
++    if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && ws->keyboard == NULL) {
++	ws->keyboard = wl_seat_get_keyboard(seat);
++	wl_keyboard_add_listener(ws->keyboard, &keyboard_listener, ws);
++    }
++}
++
++static const struct wl_seat_listener seat_listener = { seat_caps };
++
++/* ---- registry ---- */
++
++static void
++reg_global(void *data, struct wl_registry *reg, uint32_t name,
++	   const char *iface, uint32_t version)
++{
++    struct wlstate *ws = data;
++
++    UNUSED(version);
++    if (strcmp(iface, wl_compositor_interface.name) == 0) {
++	ws->compositor = wl_registry_bind(reg, name,
++					  &wl_compositor_interface, 1);
++    } else if (strcmp(iface, wl_shm_interface.name) == 0) {
++	ws->shm = wl_registry_bind(reg, name, &wl_shm_interface, 1);
++    } else if (strcmp(iface, xdg_wm_base_interface.name) == 0) {
++	ws->wm_base = wl_registry_bind(reg, name, &xdg_wm_base_interface, 1);
++	xdg_wm_base_add_listener(ws->wm_base, &wm_listener, ws);
++    } else if (strcmp(iface, wl_seat_interface.name) == 0 &&
++	       ws->seat == NULL) {
++	ws->seat = wl_registry_bind(reg, name, &wl_seat_interface, 1);
++	wl_seat_add_listener(ws->seat, &seat_listener, ws);
++    }
++}
++
++static void reg_remove(void *data, struct wl_registry *reg, uint32_t name)
++{
++    UNUSED(data);
++    UNUSED(reg);
++    UNUSED(name);
++}
++
++static const struct wl_registry_listener registry_listener = {
++    reg_global, reg_remove
++};
++
++/* ---- surface routines ---- */
++
++static int wlxdg_defaults(nsfb_t *nsfb)
++{
++    nsfb->width = 800;
++    nsfb->height = 600;
++    nsfb->format = NSFB_FMT_XRGB8888;
++
++    /* select default sw plotters for format */
++    select_plotters(nsfb);
++
++    return 0;
++}
++
++static int
++wlxdg_set_geometry(nsfb_t *nsfb, int width, int height,
++		   enum nsfb_format_e format)
++{
++    uint8_t *fbptr;
++
++    /* only the 32 bit formats that match the shm buffer */
++    if (format != NSFB_FMT_ANY && format != NSFB_FMT_XRGB8888 &&
++	format != NSFB_FMT_ARGB8888)
++	return -1;
++
++    if (width <= 0)
++	width = nsfb->width;
++    if (height <= 0)
++	height = nsfb->height;
++
++    if (nsfb->surface_priv != NULL) {
++	/* running: resize the framebuffer, buffers follow in present() */
++	struct wlstate *ws = nsfb->surface_priv;
++	nsfb_bbox_t all;
++
++	fbptr = realloc(nsfb->ptr, (size_t)width * height * 4);
++	if (fbptr == NULL)
++	    return -1;
++	nsfb->ptr = fbptr;
++	memset(nsfb->ptr, 0xff, (size_t)width * height * 4);
++	nsfb->width = width;
++	nsfb->height = height;
++	nsfb->linelen = width * 4;
++	if (nsfb->cursor != NULL)
++	    nsfb->cursor->plotted = false;	/* its save area is gone */
++	all.x0 = all.y0 = 0;
++	all.x1 = width;
++	all.y1 = height;
++	ws->dirty = false;
++	add_damage(ws, &all);
++    } else {
++	nsfb->width = width;
++	nsfb->height = height;
++    }
++    nsfb->format = NSFB_FMT_XRGB8888;
++
++    /* select soft plotters appropriate for format */
++    select_plotters(nsfb);
++
++    return 0;
++}
++
++static int wlxdg_finalise(nsfb_t *nsfb)
++{
++    struct wlstate *ws = nsfb->surface_priv;
++    int i;
++
++    if (ws == NULL)
++	return 0;
++    for (i = 0; i < NBUF; i++)
++	buf_destroy(&ws->bufs[i]);
++    if (ws->toplevel != NULL)
++	xdg_toplevel_destroy(ws->toplevel);
++    if (ws->xdg_surface != NULL)
++	xdg_surface_destroy(ws->xdg_surface);
++    if (ws->surface != NULL)
++	wl_surface_destroy(ws->surface);
++    if (ws->display != NULL) {
++	wl_display_flush(ws->display);
++	wl_display_disconnect(ws->display);
++    }
++    free(ws);
++    nsfb->surface_priv = NULL;
++    free(nsfb->ptr);
++    nsfb->ptr = NULL;
++    return 0;
++}
++
++static int wlxdg_initialise(nsfb_t *nsfb)
++{
++    struct wlstate *ws;
++    nsfb_bbox_t all;
++
++    if (nsfb->surface_priv != NULL)
++	return -1;
++
++    ws = calloc(1, sizeof(*ws));
++    if (ws == NULL)
++	return -1;
++    ws->nsfb = nsfb;
++    ws->repeat_key = NSFB_KEY_UNKNOWN;
++
++    ws->display = wl_display_connect(NULL);
++    if (ws->display == NULL) {
++	fprintf(stderr, "libnsfb: cannot connect to a Wayland display "
++		"(WAYLAND_DISPLAY, XDG_RUNTIME_DIR)\n");
++	free(ws);
++	return -1;
++    }
++    nsfb->surface_priv = ws;
++
++    ws->registry = wl_display_get_registry(ws->display);
++    wl_registry_add_listener(ws->registry, &registry_listener, ws);
++    if (wl_display_roundtrip(ws->display) < 0 || ws->compositor == NULL ||
++	ws->shm == NULL || ws->wm_base == NULL) {
++	fprintf(stderr, "libnsfb: the Wayland compositor lacks "
++		"wl_compositor, wl_shm or xdg_wm_base\n");
++	goto fail;
++    }
++
++    ws->surface = wl_compositor_create_surface(ws->compositor);
++    ws->xdg_surface = xdg_wm_base_get_xdg_surface(ws->wm_base, ws->surface);
++    xdg_surface_add_listener(ws->xdg_surface, &xsurf_listener, ws);
++    ws->toplevel = xdg_surface_get_toplevel(ws->xdg_surface);
++    xdg_toplevel_add_listener(ws->toplevel, &top_listener, ws);
++    xdg_toplevel_set_title(ws->toplevel, "NetSurf");
++    xdg_toplevel_set_app_id(ws->toplevel, "netsurf");
++    wl_surface_commit(ws->surface);
++
++    while (!ws->configured) {
++	if (wl_display_dispatch(ws->display) < 0)
++	    goto fail;
++    }
++
++    /* a tiling compositor says how big the window is */
++    if (ws->conf_w > 0 && ws->conf_h > 0) {
++	nsfb->width = ws->conf_w;
++	nsfb->height = ws->conf_h;
++    }
++    nsfb->format = NSFB_FMT_XRGB8888;
++    select_plotters(nsfb);
++    nsfb->linelen = nsfb->width * 4;
++    nsfb->ptr = malloc((size_t)nsfb->width * nsfb->height * 4);
++    if (nsfb->ptr == NULL)
++	goto fail;
++    memset(nsfb->ptr, 0xff, (size_t)nsfb->width * nsfb->height * 4);
++
++    all.x0 = all.y0 = 0;
++    all.x1 = nsfb->width;
++    all.y1 = nsfb->height;
++    add_damage(ws, &all);
++    present(ws);
++    wl_display_flush(ws->display);
++    return 0;
++
++fail:
++    wlxdg_finalise(nsfb);
++    return -1;
++}
++
++static bool wlxdg_input(nsfb_t *nsfb, nsfb_event_t *event, int timeout)
++{
++    struct wlstate *ws = nsfb->surface_priv;
++    struct pollfd pfd;
++    long long deadline, now;
++    int wait, r;
++
++    if (ws == NULL)
++	return false;
++
++    deadline = timeout < 0 ? -1 : now_ms() + timeout;
++
++    for (;;) {
++	present(ws);
++
++	if (pop_event(ws, event))
++	    return true;
++
++	if (ws->closed) {
++	    event->type = NSFB_EVENT_CONTROL;
++	    event->value.controlcode = NSFB_CONTROL_QUIT;
++	    return true;
++	}
++
++	now = now_ms();
++	if (ws->repeat_key != NSFB_KEY_UNKNOWN && now >= ws->repeat_at) {
++	    ws->repeat_at = now + REPEAT_RATE;
++	    event->type = NSFB_EVENT_KEY_DOWN;
++	    event->value.keycode = ws->repeat_key;
++	    return true;
++	}
++
++	/* how long may we sleep? */
++	wait = -1;
++	if (deadline >= 0) {
++	    if (now >= deadline) {
++		event->type = NSFB_EVENT_CONTROL;
++		event->value.controlcode = NSFB_CONTROL_TIMEOUT;
++		return true;
++	    }
++	    wait = (int)(deadline - now);
++	}
++	if (ws->repeat_key != NSFB_KEY_UNKNOWN &&
++	    (wait < 0 || ws->repeat_at - now < wait))
++	    wait = (int)(ws->repeat_at - now);
++
++	/* read and dispatch what the compositor sent */
++	while (wl_display_prepare_read(ws->display) != 0)
++	    wl_display_dispatch_pending(ws->display);
++	if (wl_display_flush(ws->display) < 0 && errno != EAGAIN) {
++	    wl_display_cancel_read(ws->display);
++	    ws->closed = true;
++	    continue;
++	}
++	pfd.fd = wl_display_get_fd(ws->display);
++	pfd.events = POLLIN;
++	pfd.revents = 0;
++	r = poll(&pfd, 1, wait);
++	if (r > 0) {
++	    if (wl_display_read_events(ws->display) < 0)
++		ws->closed = true;
++	} else {
++	    wl_display_cancel_read(ws->display);
++	}
++	if (wl_display_dispatch_pending(ws->display) < 0)
++	    ws->closed = true;
++    }
++}
++
++static int wlxdg_claim(nsfb_t *nsfb, nsfb_bbox_t *box)
++{
++    struct nsfb_cursor_s *cursor = nsfb->cursor;
++
++    if ((cursor != NULL) &&
++	(cursor->plotted == true) &&
++	(nsfb_plot_bbox_intersect(box, &cursor->loc))) {
++	nsfb_cursor_clear(nsfb, cursor);
++    }
++    return 0;
++}
++
++static int wlxdg_cursor(nsfb_t *nsfb, struct nsfb_cursor_s *cursor)
++{
++    struct wlstate *ws = nsfb->surface_priv;
++    nsfb_bbox_t redraw;
++    nsfb_bbox_t fbarea;
++
++    if (ws == NULL)
++	return 0;
++
++    if ((cursor != NULL) && (cursor->plotted == true)) {
++	nsfb_plot_add_rect(&cursor->savloc, &cursor->loc, &redraw);
++
++	/* screen area */
++	fbarea.x0 = 0;
++	fbarea.y0 = 0;
++	fbarea.x1 = nsfb->width;
++	fbarea.y1 = nsfb->height;
++
++	nsfb_plot_clip(&fbarea, &redraw);
++
++	nsfb_cursor_clear(nsfb, cursor);
++	nsfb_cursor_plot(nsfb, cursor);
++
++	add_damage(ws, &redraw);
++    }
++    return true;
++}
++
++static int wlxdg_update(nsfb_t *nsfb, nsfb_bbox_t *box)
++{
++    struct wlstate *ws = nsfb->surface_priv;
++    struct nsfb_cursor_s *cursor = nsfb->cursor;
++
++    if (ws == NULL)
++	return 0;
++
++    if ((cursor != NULL) && (cursor->plotted == false)) {
++	nsfb_cursor_plot(nsfb, cursor);
++    }
++
++    add_damage(ws, box);
++    return 0;
++}
++
++const nsfb_surface_rtns_t wlxdg_rtns = {
++    .defaults = wlxdg_defaults,
++    .initialise = wlxdg_initialise,
++    .finalise = wlxdg_finalise,
++    .input = wlxdg_input,
++    .claim = wlxdg_claim,
++    .update = wlxdg_update,
++    .cursor = wlxdg_cursor,
++    .geometry = wlxdg_set_geometry,
++};
++
++NSFB_SURFACE_DEF(wl, NSFB_SURFACE_WL, &wlxdg_rtns)
++
++/*
++ * Local variables:
++ *  c-basic-offset: 4
++ *  tab-width: 8
++ * End:
++ */
+diff -ruN -x '*.orig' -x '*.rej' -x __pycache__ -x '*.pyc' -x Messages a/netsurf/utils/config.h b/netsurf/utils/config.h
+--- a/netsurf/utils/config.h	2023-12-28 02:57:23.095317100 +0200
++++ b/netsurf/utils/config.h	2026-11-14 13:25:01.114586945 +0200
+@@ -149,7 +149,8 @@
+ #define HAVE_DIRFD
+ #define HAVE_UNLINKAT
+ #define HAVE_FSTATAT
+-#if (defined(_WIN32) || defined(__riscos__) || defined(__HAIKU__) || defined(__BEOS__) || defined(__amigaos4__) || defined(__AMIGA__) || defined(__MINT__))
++/* MINIX: the *at() calls are declared (NetBSD headers) but not implemented */
++#if (defined(_WIN32) || defined(__riscos__) || defined(__HAIKU__) || defined(__BEOS__) || defined(__amigaos4__) || defined(__AMIGA__) || defined(__MINT__) || defined(__minix))
+ #undef HAVE_DIRFD
+ #undef HAVE_UNLINKAT
+ #undef HAVE_FSTATAT
