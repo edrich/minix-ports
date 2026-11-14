@@ -4,19 +4,23 @@
 #
 #  1. Prepare (automatic when stale): copy ../minix/minix_x86.img to
 #     build/desktop/minix-desktop.img and install rootfs/usr/pkg (stripped,
-#     via stage-payload.sh) plus desktop/start-hyprland.sh into it, using
-#     the headless harness with --persist.  Redone whenever the base image,
-#     rootfs/usr/pkg or desktop/ is newer than the desktop image.
+#     via stage-payload.sh) plus the session files of desktop/ into it
+#     (desktop/install.sh: start-hyprland, /etc/rc.d/hyprland, the desktop
+#     user "desk"), using the headless harness with --persist.  Redone
+#     whenever the base image, rootfs/usr/pkg or desktop/ is newer than the
+#     desktop image.
 #  2. Boot it: serial console (root login, no password) in this terminal,
 #     screen on VNC 127.0.0.1:5901 (a viewer is started if one is found).
-#     In the guest: `start-hyprland`, then SUPER+Return (or ALT+Return)
-#     in the VNC window opens foot.  Leave with `poweroff`, or Ctrl-A x.
+#     In the guest: `start-hyprland` (runs Hyprland as "desk"), then
+#     SUPER+Return (or ALT+Return) in the VNC window opens foot.
+#     `start-hyprland enable` (with PERSIST=1) starts it at every boot.
+#     Leave with `poweroff`, or Ctrl-A x.
 #
 # Env: IMAGE=<base image>  MEM=<MB, default 256>  VNC=<display, default 1>
 #      PERSIST=1 (keep guest changes; default snapshot - crashed
 #      compositors' core dumps otherwise fill the root fs)
 #      NOVIEWER=1 (do not start a VNC viewer)
-# Args: prepare (only step 1, forced)
+# Args: prepare (only step 1, forced).  Gate: test-desktop.sh.
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -41,12 +45,12 @@ prepare() {
 	rm -rf "$WORK/payload" "$IMG.tmp"
 	mkdir -p "$WORK/payload"
 	"$HERE/stage-payload.sh" "$WORK/payload"
-	cp "$HERE/desktop/start-hyprland.sh" "$WORK/payload/scripts/"
+	cp "$HERE"/desktop/* "$WORK/payload/scripts/"
 	cp --sparse=always "$BASE" "$IMG.tmp"
 	"$REPO/releasetools/x86_qemu.py" --image "$IMG.tmp" --bootdir "$BOOTDIR" \
 		--persist --payload "$WORK/payload" --timeout 900 \
 		--cmd 'cp -Rp /mnt/pkg/* /usr/pkg/ && echo installed' \
-		--cmd 'cp /mnt/scripts/start-hyprland.sh /usr/pkg/bin/start-hyprland && chmod 755 /usr/pkg/bin/start-hyprland' \
+		--cmd 'sh /mnt/scripts/install.sh' \
 		--cmd 'df' \
 		--expect 'HARNESS:DONE:0' \
 		--log "$WORK/prepare.log" > /dev/null ||

@@ -152,3 +152,30 @@ for p in libffi wayland wayland-protocols pixman xkeyboard-config \
 ./test-input.sh             # input stack gate (libinput/libseat/udev)
 ./test-weston.sh            # Weston desktop gate (Phase 6)
 ```
+
+## Desktop image (Hyprland session)
+
+`run-hyprland.sh` makes `build/desktop/minix-desktop.img` (the OS image +
+the ports in `/usr/pkg` + the session files of `desktop/`) and boots it
+with the screen on VNC and the serial console in the terminal:
+
+```
+./run-hyprland.sh           # prepare when stale, then boot (VNC :1)
+  minix# start-hyprland     # Hyprland as user "desk"; SUPER/ALT+Return = foot
+  minix# start-hyprland ctl clients | status | stop
+  minix# start-hyprland enable      # start at boot (use PERSIST=1)
+./test-desktop.sh           # gate: session as desk, foot, autostart at boot
+./test-hyprland.sh ./test-foot.sh ./test-mouse.sh ./test-blit.sh
+```
+
+- `desktop/start-hyprland.sh` -> `/usr/pkg/bin/start-hyprland`: session
+  environment (wlroots software-rendering variables, `LANG=en_US.UTF-8`,
+  `XDG_RUNTIME_DIR=/tmp/xdg-<user>`, `ulimit -c 0`), default
+  `~/.config/hypr/hyprland.conf` on first start (key list in the script
+  header).  Root hands over to the desktop user.
+- `desktop/install.sh` (run in the guest by the prepare step): user
+  `desk` (`useradd -G operator`: /dev/drm0 and /dev/input/event* are
+  root:operator 660; operator is gid 0 on MINIX, so `ls` shows "wheel"),
+  `/etc/rc.d/hyprland` + `hyprland=NO` in `/etc/rc.conf`.
+- While Hyprland runs it owns keyboard and mouse: the VGA text console
+  gets no keys.  Serial console and network logins are unaffected.

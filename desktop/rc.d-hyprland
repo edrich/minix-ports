@@ -1,0 +1,23 @@
+#!/bin/sh
+#
+# /etc/rc.d/hyprland - start the Hyprland session at boot (installed into
+# the desktop image by run-hyprland.sh).  Enabled by hyprland=YES in
+# /etc/rc.conf (`start-hyprland enable`); the session runs as the desktop
+# user, see /usr/pkg/bin/start-hyprland.  While it runs, the keyboard and
+# mouse belong to Hyprland: the VGA console gets no keys (serial console
+# and network logins still work; `start-hyprland stop` gives them back).
+
+# PROVIDE: hyprland
+# REQUIRE: LOGIN
+
+$_rc_subr_loaded . /etc/rc.subr
+
+name="hyprland"
+rcvar=$name
+start_cmd="/usr/pkg/bin/start-hyprland start"
+stop_cmd="/usr/pkg/bin/start-hyprland stop"
+status_cmd="/usr/pkg/bin/start-hyprland status"
+extra_commands="status"
+
+load_rc_config $name
+run_rc_command "$1"
