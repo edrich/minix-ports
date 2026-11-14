@@ -153,15 +153,23 @@ for p in libffi wayland wayland-protocols pixman xkeyboard-config \
 ./test-weston.sh            # Weston desktop gate (Phase 6)
 ```
 
-## Command line applications (git, curl)
+## Command line applications (git, curl, vim)
 
 ```
 ./build-port.sh zlib; ./build-port.sh openssl; ./build-port.sh curl
-./build-port.sh git
+./build-port.sh git; ./build-port.sh vim
 ./test-git.sh               # gate: local git work + https clone (needs network)
 NONET=1 ./test-git.sh       # local part only
+./test-vim.sh               # gate: scripted edits + vim typed into in foot
 ```
 
+- `vim` 9.1.2148: huge feature set, terminal only (base libterminfo; foot
+  runs it with `TERM=xterm-256color`), Wayland clipboard support, no
+  scripting-language interfaces.  The base system's `vi` (nvi) stays
+  `/usr/bin/vi`; this one is `/usr/pkg/bin/vim` (`view`, `vimdiff`, `xxd`).
+  The gate needs a MINIX libc with the eventfd/epoll_pwait fixes of
+  2026-11-14 (minix repo, docs/UPDATING): without them foot does not
+  close when the program in it exits.
 - `zlib` 1.3.1 and `openssl` 3.5.4 are installed in `/usr/pkg` next to the
   base system's much older ones (zlib 1.2.3, OpenSSL 1.0.1p); ports find
   them first through the `-I`/`-L` order and the `/usr/pkg/lib` RPATH.
